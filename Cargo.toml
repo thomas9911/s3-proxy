@@ -7,6 +7,8 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.79"
+askama = { version = "0.12.1", features = ["with-axum"] }
+askama_axum = "0.4.0"
 axum = { version = "0.7.4", features = ["http2", "multipart"] }
 axum-route-error = "5.0.1"
 config = { version = "0.14.0", default-features = false }
@@ -14,4 +16,10 @@ deadpool-redis = { version = "0.14.0", features = ["rt_tokio_1", "serde"] }
 opendal = "0.44.2"
 quick-xml = { version = "0.31.0", features = ["serialize", "async-tokio"] }
 serde = { version = "1.0.196", features = ["derive"] }
+time = "0.3.32"
 tokio = { version = "1.35.1", features = ["full"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.13"
+aws-config = { version = "1.1.4", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1.14.0"

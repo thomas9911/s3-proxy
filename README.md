@@ -9,3 +9,24 @@ backends:
 
 metadata:
 - redis
+
+
+
+
+
+
+
+## extra
+
+maybe use https://github.com/seaweedfs/seaweedfs as s3 
+
+
+## metadata
+
+```txt                              
+keypair ---|                 |--- dir -|- cors
+           |                 |         |- acl
+keypair ---|--- namespace ---|--- dir
+           |                 |         |- cors
+keypair ---|                 |--- dir -|- acl
+```

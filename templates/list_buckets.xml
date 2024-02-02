@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListAllMyBucketsResult>
+   <Buckets>
+      {%- for bucket in buckets -%}
+      <Bucket>
+         {%- match bucket.timestamp -%}
+            {%- when Some with (bucket) -%}
+         <CreationDate>{{ bucket }}</CreationDate>
+            {%- when None -%}
+         {%- endmatch -%}
+         <Name>{{ bucket.name }}</Name>
+      </Bucket>
+      {%- endfor -%}
+   </Buckets>
+   <Owner>
+      <DisplayName>{{ owner_name }}</DisplayName>
+      <ID>{{ owner_id }}</ID>
+   </Owner>
+</ListAllMyBucketsResult>
