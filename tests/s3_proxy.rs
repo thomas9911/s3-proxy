@@ -16,6 +16,8 @@ fn setup() -> std::io::Result<Child> {
         .env("S3_PROXY__REDIS__URL", "redis://127.0.0.1:6379")
         .spawn();
 
+    // tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).init();
+
     process
 }
 
@@ -33,7 +35,15 @@ async fn test_it_runs() {
         .await;
     let client = Client::new(&shared_config);
 
-    let out = client.list_buckets().send().await.unwrap();
+    let req = client.list_buckets();
+
+    dbg!(&req.as_input().clone().build());
+
+    let out_res = req.send().await;
+
+    process.kill().expect("command couldn't be killed");
+
+    let out = out_res.unwrap();
 
     let buckets = out.buckets();
     let expected_buckets = vec![
@@ -51,8 +61,6 @@ async fn test_it_runs() {
         .set_display_name(Some("Testing".to_string()))
         .set_id(Some("1".to_string()))
         .build();
-
-    process.kill().expect("command couldn't be killed");
 
     assert_eq!(buckets, expected_buckets);
     assert_eq!(owner, Some(&expected_owner));
