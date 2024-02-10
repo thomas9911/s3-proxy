@@ -1,12 +1,10 @@
 use std::process::{Child, Command};
 
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::{
-    config::Region,
-    primitives::DateTime,
-    types::{Bucket, Owner},
-    Client,
-};
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::primitives::DateTime;
+use aws_sdk_s3::types::{Bucket, Owner};
+use aws_sdk_s3::Client;
 
 fn setup() -> std::io::Result<Child> {
     // let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
