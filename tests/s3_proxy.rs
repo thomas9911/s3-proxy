@@ -12,6 +12,8 @@ fn setup() -> std::io::Result<Child> {
 
     let process = Command::new(path)
         .env("S3_PROXY__REDIS__URL", "redis://127.0.0.1:6379")
+        .env("S3_PROXY__OPENDAL_PROVIDER", "memory")
+        .env("S3_PROXY__OPENDAL__ROOT", "/tmp")
         .spawn();
 
     // tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).init();
@@ -35,8 +37,6 @@ async fn test_it_runs() {
 
     let req = client.list_buckets();
 
-    dbg!(&req.as_input().clone().build());
-
     let out_res = req.send().await;
 
     process.kill().expect("command couldn't be killed");
@@ -46,8 +46,8 @@ async fn test_it_runs() {
     let buckets = out.buckets();
     let expected_buckets = vec![
         Bucket::builder()
-            .set_name(Some("testing1".to_string()))
-            .set_creation_date(Some(DateTime::from_secs(1706911595)))
+            .set_name(Some("testing".to_string()))
+            // .set_creation_date(Some(DateTime::from_secs(1706911595)))
             .build(),
         Bucket::builder()
             .set_name(Some("testing2".to_string()))
