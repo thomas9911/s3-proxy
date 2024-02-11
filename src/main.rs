@@ -1,8 +1,11 @@
-use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, put};
 use axum::Router;
+use axum::{
+    body::Body,
+    extract::{Path, State},
+};
 use axum_route_error::RouteError;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
@@ -114,7 +117,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/_metadata", get(asdfg))
         .route("/", get(list_buckets))
         .route("/:bucket_name/", put(create_bucket))
-        .route("/:bucket_name/:object_name", put(create_object))
+        .route(
+            "/:bucket_name/:object_name",
+            get(get_object).put(create_object),
+        )
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state);
 
@@ -250,4 +256,27 @@ async fn create_object(
         .await?;
 
     Ok("OK".into_response())
+}
+
+async fn get_object(
+    Path((bucket_name, object_name)): Path<(String, String)>,
+    State(AppState {
+        opendal_operator, ..
+    }): State<AppState>,
+    signature: VerifiedRequest,
+) -> Result<impl IntoResponse, RouteError> {
+    let namespace = signature.namespace;
+
+    if opendal_operator
+        .is_exist(&format!("{}/{}", namespace, bucket_name))
+        .await?
+    {
+        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
+    }
+
+    let reader = opendal_operator
+        .reader(&format!("{}/{}/{}", namespace, bucket_name, object_name))
+        .await?;
+
+    Ok(Body::from_stream(reader).into_response())
 }

@@ -53,6 +53,13 @@ async fn test_it_runs() {
         .send()
         .await;
 
+    let get_object_res = client
+        .get_object()
+        .bucket("testing2")
+        .key("run.sh")
+        .send()
+        .await;
+
     process.kill().expect("command couldn't be killed");
 
     let out = list_bucket_res.unwrap();
@@ -77,4 +84,8 @@ async fn test_it_runs() {
     assert_eq!(buckets, expected_buckets);
     assert_eq!(owner, Some(&expected_owner));
     assert!(put_object_res.is_ok());
+
+    let response = get_object_res.unwrap();
+    let body = String::from_utf8(response.body.collect().await.unwrap().to_vec()).unwrap();
+    assert!(body.contains("cargo run"));
 }
