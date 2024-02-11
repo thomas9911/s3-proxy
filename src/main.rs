@@ -148,23 +148,14 @@ async fn list_buckets(
 ) -> Result<impl IntoResponse, RouteError> {
     let namespace = &signature.namespace;
 
-    let bucket = "testing";
+    // let bucket = "testing";
 
-    opendal_operator
-        .create_dir(&format!("{}/", namespace))
-        .await?;
-    opendal_operator
-        .create_dir(&format!("{}/{}/", namespace, bucket))
-        .await?;
-    opendal_operator
-        .create_dir(&format!("{}/{}/", namespace, "testing2"))
-        .await?;
-    opendal_operator
-        .write(
-            &format!("{}/{}/testing.bin", namespace, bucket),
-            vec![0; 4096],
-        )
-        .await?;
+    // opendal_operator
+    //     .write(
+    //         &format!("{}/{}/testing.bin", namespace, bucket),
+    //         vec![0; 4096],
+    //     )
+    //     .await?;
 
     let mut lister = opendal_operator
         .lister_with(&format!("{}/", namespace))
@@ -221,7 +212,7 @@ async fn create_bucket(
 
     let utf8_slice = std::str::from_utf8(&signature.bytes)?;
 
-    let _body: templates::CreateBucket = quick_xml::de::from_str(utf8_slice)?;
+    let _body: Option<templates::CreateBucket> = quick_xml::de::from_str(utf8_slice)?;
 
     opendal_operator
         .create_dir(&format!("{}/", namespace))

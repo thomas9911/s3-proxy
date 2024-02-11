@@ -1,10 +1,9 @@
 use std::process::{Child, Command};
 
 use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::config::Region;
-use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::{Bucket, Owner};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::Region;
 
 fn setup() -> std::io::Result<Child> {
     // let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
@@ -35,9 +34,13 @@ async fn test_it_runs() {
         .await;
     let client = Client::new(&shared_config);
 
-    let req = client.list_buckets();
+    let create_bucket_req1 = client.create_bucket().bucket("testing");
+    let create_bucket_req2 = client.create_bucket().bucket("testing2");
+    let list_bucket_req = client.list_buckets();
 
-    let out_res = req.send().await;
+    let _ = create_bucket_req1.send().await;
+    let _ = create_bucket_req2.send().await;
+    let out_res = list_bucket_req.send().await;
 
     process.kill().expect("command couldn't be killed");
 
