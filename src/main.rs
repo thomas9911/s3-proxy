@@ -1,4 +1,5 @@
 use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, put};
 use axum::Router;
@@ -113,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/_metadata", get(asdfg))
         .route("/", get(list_buckets))
         .route("/:bucket_name/", put(create_bucket))
+        .route("/:bucket_name/:object_name", put(create_object))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state);
 
@@ -219,6 +221,32 @@ async fn create_bucket(
         .await?;
     opendal_operator
         .create_dir(&format!("{}/{}/", namespace, bucket_name))
+        .await?;
+
+    Ok("OK".into_response())
+}
+
+async fn create_object(
+    Path((bucket_name, object_name)): Path<(String, String)>,
+    State(AppState {
+        opendal_operator, ..
+    }): State<AppState>,
+    signature: VerifiedRequest,
+) -> Result<impl IntoResponse, RouteError> {
+    let namespace = signature.namespace;
+
+    if opendal_operator
+        .is_exist(&format!("{}/{}", namespace, bucket_name))
+        .await?
+    {
+        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
+    }
+
+    opendal_operator
+        .write(
+            &format!("{}/{}/{}", namespace, bucket_name, object_name),
+            signature.bytes,
+        )
         .await?;
 
     Ok("OK".into_response())

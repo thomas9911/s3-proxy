@@ -1,9 +1,11 @@
+use std::path::Path;
 use std::process::{Child, Command};
 
 use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::config::Region;
+use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, Owner};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Region;
 
 fn setup() -> std::io::Result<Child> {
     // let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
@@ -40,11 +42,20 @@ async fn test_it_runs() {
 
     let _ = create_bucket_req1.send().await;
     let _ = create_bucket_req2.send().await;
-    let out_res = list_bucket_req.send().await;
+    let list_bucket_res = list_bucket_req.send().await;
+
+    let body = ByteStream::from_path(Path::new("run.sh")).await;
+    let put_object_res = client
+        .put_object()
+        .bucket("testing2")
+        .key("run.sh")
+        .body(body.unwrap())
+        .send()
+        .await;
 
     process.kill().expect("command couldn't be killed");
 
-    let out = out_res.unwrap();
+    let out = list_bucket_res.unwrap();
 
     let buckets = out.buckets();
     let expected_buckets = vec![
@@ -65,4 +76,5 @@ async fn test_it_runs() {
 
     assert_eq!(buckets, expected_buckets);
     assert_eq!(owner, Some(&expected_owner));
+    assert!(put_object_res.is_ok());
 }

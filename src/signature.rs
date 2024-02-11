@@ -1,4 +1,5 @@
 use askama_axum::IntoResponse;
+use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
@@ -7,14 +8,11 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4::SigningParams;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request};
-use axum::http::{HeaderMap, Method, Response, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
 use deadpool_redis::redis::{AsyncCommands, RedisError};
 use deadpool_redis::PoolError;
-
 use std::convert::Infallible;
 use std::time::SystemTime;
-
-use async_trait::async_trait;
 use time::error::Parse;
 
 use tracing::error;
@@ -176,6 +174,13 @@ pub fn verify_headers(
     secret_key: &str,
     bytes: &[u8],
 ) -> bool {
+    let payload = match header_map.get("x-amz-content-sha256") {
+        Some(header_value) if header_value == HeaderValue::from_static("UNSIGNED-PAYLOAD") => {
+            SignableBody::UnsignedPayload
+        }
+        _ => SignableBody::Bytes(bytes),
+    };
+
     // the same as aws list bucket request found via tracing
     let mut settings = SigningSettings::default();
     settings.percent_encoding_mode = PercentEncodingMode::Single;
@@ -217,7 +222,7 @@ pub fn verify_headers(
             .iter()
             .filter(|(key, _)| params.signed_headers.contains(&key.as_str()))
             .map(|(key, value)| (key.as_str(), value.to_str().unwrap())),
-        SignableBody::Bytes(bytes),
+        payload,
     )
     .expect("host is not valid");
 
@@ -280,9 +285,6 @@ pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params> 
 
     Some(params)
 }
-
-#[cfg(test)]
-use axum::http::HeaderValue;
 
 #[test]
 fn verify_headers_correct_secret_test() {
