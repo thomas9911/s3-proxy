@@ -5,16 +5,14 @@ use aws_sigv4::http_request::{
     SignatureLocation, SigningSettings, UriPathNormalizationMode,
 };
 use aws_sigv4::sign::v4::SigningParams;
-use axum::{
-    body::Body,
-    extract::OriginalUri,
-    http::{HeaderMap, HeaderValue, Response, StatusCode},
-};
-use axum::{extract::FromRequestParts, http::request::Parts};
+use axum::body::{Body, Bytes};
+use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request};
+use axum::http::{HeaderMap, Method, Response, StatusCode};
 use deadpool_redis::redis::{AsyncCommands, RedisError};
 use deadpool_redis::PoolError;
 
-use std::{convert::Infallible, time::SystemTime};
+use std::convert::Infallible;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use time::error::Parse;
@@ -32,36 +30,37 @@ pub struct S3V4Params<'a> {
     pub signature: &'a str,
 }
 
-use time::{format_description, Date, PrimitiveDateTime, Time};
+use time::{format_description, PrimitiveDateTime};
 
 use crate::AppState;
 
 const DATE_TIME_FORMAT: &str = "[year][month][day]T[hour][minute][second]Z";
-const DATE_FORMAT: &str = "[year][month][day]";
 
 #[derive(Debug, Default, PartialEq)]
-pub struct Signature {
+pub struct VerifiedRequest {
     pub access_key: String,
+    pub namespace: String,
+    pub bytes: Bytes,
 }
 
-pub enum SignatureError {
+pub enum VerifiedRequestError {
     FormattedResponse(Response<Body>),
     Pool(PoolError),
     Redis(RedisError),
 }
 
-impl IntoResponse for SignatureError {
+impl IntoResponse for VerifiedRequestError {
     fn into_response(self) -> Response<Body> {
         match self {
-            SignatureError::FormattedResponse(response) => response,
-            SignatureError::Pool(error) => {
+            VerifiedRequestError::FormattedResponse(response) => response,
+            VerifiedRequestError::Pool(error) => {
                 error!("{}", error.to_string());
 
                 let mut response = Response::default();
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
                 response
             }
-            SignatureError::Redis(error) => {
+            VerifiedRequestError::Redis(error) => {
                 error!("{}", error.to_string());
 
                 let mut response = Response::default();
@@ -72,42 +71,48 @@ impl IntoResponse for SignatureError {
     }
 }
 
-impl From<Response<Body>> for SignatureError {
+impl From<Response<Body>> for VerifiedRequestError {
     fn from(value: Response<Body>) -> Self {
-        SignatureError::FormattedResponse(value)
+        VerifiedRequestError::FormattedResponse(value)
     }
 }
 
-impl From<Infallible> for SignatureError {
+impl From<Infallible> for VerifiedRequestError {
     fn from(_: Infallible) -> Self {
         unreachable!()
     }
 }
 
-impl From<PoolError> for SignatureError {
+impl From<PoolError> for VerifiedRequestError {
     fn from(value: PoolError) -> Self {
-        SignatureError::Pool(value)
+        VerifiedRequestError::Pool(value)
     }
 }
 
-impl From<RedisError> for SignatureError {
+impl From<RedisError> for VerifiedRequestError {
     fn from(value: RedisError) -> Self {
-        SignatureError::Redis(value)
+        VerifiedRequestError::Redis(value)
     }
 }
 
 #[async_trait]
-impl FromRequestParts<AppState> for Signature {
-    type Rejection = SignatureError;
+impl FromRequest<AppState> for VerifiedRequest {
+    type Rejection = VerifiedRequestError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
         let metadata_pool = &state.metadata_pool;
         let config = &state.config;
-        let header_map = HeaderMap::from_request_parts(parts, state).await?;
-        let OriginalUri(original_uri) = OriginalUri::from_request_parts(parts, state).await?;
+        let (mut parts, body) = req.into_parts();
+        let header_map = HeaderMap::from_request_parts(&mut parts, state).await?;
+        let OriginalUri(original_uri) = OriginalUri::from_request_parts(&mut parts, state).await?;
+        let http_method = &parts.method;
+
+        let cloned_parts = parts.clone();
+
+        let extra_requests = Request::from_parts(cloned_parts, body);
+        let bytes = Bytes::from_request(extra_requests, &state)
+            .await
+            .map_err(|e| e.into_response())?;
 
         let params = match parse_authorization_header(&header_map) {
             Some(params) => params,
@@ -123,11 +128,11 @@ impl FromRequestParts<AppState> for Signature {
         {
             Ok(Some(result)) => result,
             Ok(None) => {
-                let mut response = String::from("asdfag").into_response();
+                let mut response = String::from("secret key not found").into_response();
                 *response.status_mut() = StatusCode::NOT_FOUND;
                 return Err(response.into());
             }
-            Err(error) => return Err(SignatureError::from(error)),
+            Err(error) => return Err(VerifiedRequestError::from(error)),
         };
 
         let external_host = &config.external_server_host;
@@ -135,16 +140,20 @@ impl FromRequestParts<AppState> for Signature {
         if !verify_headers(
             &header_map,
             &params,
+            http_method,
             &format!("{external_host}{original_uri}"),
             &secret_key,
+            &bytes,
         ) {
-            let mut response = String::from("asdfag").into_response();
+            let mut response = String::from("not allowed :( ").into_response();
             *response.status_mut() = StatusCode::UNAUTHORIZED;
             return Err(response.into());
         };
 
-        Ok(Signature {
+        Ok(VerifiedRequest {
             access_key: params.access_key.to_string(),
+            namespace: params.access_key.to_string(),
+            bytes,
         })
     }
 }
@@ -159,21 +168,13 @@ pub(crate) fn parse_date_time(date_time_str: &str) -> Result<SystemTime, Parse> 
     Ok(date_time.into())
 }
 
-/// Parses `YYYYMMDD` formatted dates into a `SystemTime`.
-pub(crate) fn parse_date(date_str: &str) -> Result<SystemTime, Parse> {
-    let date_time = PrimitiveDateTime::new(
-        Date::parse(date_str, &format_description::parse(DATE_FORMAT).unwrap())?,
-        Time::from_hms(0, 0, 0).unwrap(),
-    )
-    .assume_utc();
-    Ok(date_time.into())
-}
-
 pub fn verify_headers(
     header_map: &HeaderMap,
     params: &S3V4Params,
+    http_method: &Method,
     full_host: &str,
     secret_key: &str,
+    bytes: &[u8],
 ) -> bool {
     // the same as aws list bucket request found via tracing
     let mut settings = SigningSettings::default();
@@ -210,13 +211,13 @@ pub fn verify_headers(
     let signer = builder.build().unwrap();
 
     let request = SignableRequest::new(
-        "GET",
+        http_method.as_str(),
         full_host,
         header_map
             .iter()
             .filter(|(key, _)| params.signed_headers.contains(&key.as_str()))
             .map(|(key, value)| (key.as_str(), value.to_str().unwrap())),
-        SignableBody::Bytes(&[]),
+        SignableBody::Bytes(bytes),
     )
     .expect("host is not valid");
 
@@ -280,6 +281,9 @@ pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params> 
     Some(params)
 }
 
+#[cfg(test)]
+use axum::http::HeaderValue;
+
 #[test]
 fn verify_headers_correct_secret_test() {
     let secret_key = "notrealrnrELgWzOk3IfjzDKtFBhDby";
@@ -313,8 +317,10 @@ fn verify_headers_correct_secret_test() {
     assert!(verify_headers(
         &header_map,
         &parse_authorization_header(&header_map).unwrap(),
+        &Method::GET,
         "http://127.0.0.1:3000/?x-id=ListBuckets",
-        secret_key
+        secret_key,
+        &[]
     ))
 }
 
@@ -351,8 +357,10 @@ fn verify_headers_incorrect_secret_test() {
     assert!(!verify_headers(
         &header_map,
         &parse_authorization_header(&header_map).unwrap(),
+        &Method::GET,
         "http://127.0.0.1:3000/?x-id=ListBuckets",
-        secret_key
+        secret_key,
+        &[]
     ))
 }
 

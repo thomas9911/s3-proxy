@@ -1,23 +1,22 @@
-use axum::http::HeaderMap;
+use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::Router;
-use axum::{
-    extract::{Host, OriginalUri, State},
-    http::StatusCode,
-};
 use axum_route_error::RouteError;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
 use opendal::Operator;
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, str::FromStr, sync::Arc, time::SystemTime};
-use time::format_description::well_known::Rfc3339;
-use time::OffsetDateTime;
+use serde::{Deserialize, Deserializer};
+use std::collections::HashMap;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::SystemTime;
 use tokio_stream::StreamExt;
+use tower::ServiceBuilder;
+use tower_http::trace::TraceLayer;
 use tracing::Level;
 
-use crate::signature::Signature;
+use crate::signature::VerifiedRequest;
 
 mod signature;
 mod templates;
@@ -113,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/_metadata", get(asdfg))
         .route("/", get(list_buckets))
+        .route("/:bucket_name/", put(create_bucket))
+        .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(server_host).await?;
@@ -139,77 +140,13 @@ async fn asdfg(
     Ok(Json(res))
 }
 
-// async fn list_buckets(
-//     header_map: HeaderMap,
-//     OriginalUri(original_uri): OriginalUri,
-// State(AppState {
-//     metadata_pool,
-//     config,
-//     ..
-// }): State<AppState>,
-// ) -> Result<impl IntoResponse, RouteError> {
-//     let params = match signature::parse_authorization_header(&header_map) {
-//         Some(params) => params,
-//         None => {
-//             let mut response = String::from("asdfag").into_response();
-//             *response.status_mut() = StatusCode::NOT_FOUND;
-//             return Ok(response);
-//         }
-//     };
-
-//     let mut conn = metadata_pool.get().await?;
-//     let secret_key: String = match conn.get(format!("secret_key::{}", params.access_key)).await {
-//         Ok(result) => result,
-//         _ => {
-//             let mut response = String::from("asdfag").into_response();
-//             *response.status_mut() = StatusCode::NOT_FOUND;
-//             return Ok(response);
-//         }
-//     };
-
-//     let external_host = &config.external_server_host;
-
-//     if !signature::verify_headers(
-//         &header_map,
-//         &params,
-//         &format!("{external_host}{original_uri}"),
-//         &secret_key,
-//     ) {
-//         let mut response = String::from("asdfag").into_response();
-//         *response.status_mut() = StatusCode::UNAUTHORIZED;
-//         return Ok(response);
-//     };
-
-//     let datetime = OffsetDateTime::from_unix_timestamp(1706911595)?;
-//     let tmp_timestamp = datetime.format(&Rfc3339).unwrap();
-
-//     let template = templates::ListBucketsTemplate {
-//         owner_name: "Testing",
-//         owner_id: "1",
-//         buckets: vec![
-//             templates::ListBucketItem {
-//                 name: "testing1",
-//                 timestamp: Some(&tmp_timestamp),
-//             },
-//             templates::ListBucketItem {
-//                 name: "testing2",
-//                 timestamp: None,
-//             },
-//         ],
-//     };
-
-//     Ok(askama_axum::into_response(&template))
-// }
-
 async fn list_buckets(
-    signature: Signature,
     State(AppState {
         opendal_operator, ..
     }): State<AppState>,
+    signature: VerifiedRequest,
 ) -> Result<impl IntoResponse, RouteError> {
-    // dbg!(signature);
-    // dbg!(opendal_operator);
-    let namespace = &signature.access_key;
+    let namespace = &signature.namespace;
 
     let bucket = "testing";
 
@@ -271,4 +208,27 @@ async fn list_buckets(
     };
 
     Ok(askama_axum::into_response(&template))
+}
+
+async fn create_bucket(
+    Path(bucket_name): Path<String>,
+    State(AppState {
+        opendal_operator, ..
+    }): State<AppState>,
+    signature: VerifiedRequest,
+) -> Result<impl IntoResponse, RouteError> {
+    let namespace = &signature.namespace;
+
+    let utf8_slice = std::str::from_utf8(&signature.bytes)?;
+
+    let _body: templates::CreateBucket = quick_xml::de::from_str(utf8_slice)?;
+
+    opendal_operator
+        .create_dir(&format!("{}/", namespace))
+        .await?;
+    opendal_operator
+        .create_dir(&format!("{}/{}/", namespace, bucket_name))
+        .await?;
+
+    Ok("OK".into_response())
 }
