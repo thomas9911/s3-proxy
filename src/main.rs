@@ -1,4 +1,7 @@
-use axum::http::StatusCode;
+use axum::http::{
+    header::{CONTENT_LENGTH, CONTENT_TYPE},
+    HeaderMap, HeaderValue, StatusCode,
+};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{get, put};
 use axum::Router;
@@ -234,6 +237,7 @@ async fn create_bucket(
 
 async fn create_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
+    header_map: HeaderMap,
     State(AppState {
         opendal_operator, ..
     }): State<AppState>,
@@ -248,12 +252,22 @@ async fn create_object(
         return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
     }
 
-    opendal_operator
-        .write(
-            &format!("{}/{}/{}", namespace, bucket_name, object_name),
-            signature.bytes,
-        )
-        .await?;
+    let mut writer = opendal_operator.write_with(
+        &format!("{}/{}/{}", namespace, bucket_name, object_name),
+        signature.bytes,
+    );
+
+    writer = if let Some(content_type) = header_map.get(CONTENT_TYPE) {
+        if let Ok(content_type) = content_type.to_str() {
+            writer.content_type(content_type)
+        } else {
+            writer
+        }
+    } else {
+        writer
+    };
+
+    writer.await?;
 
     Ok("OK".into_response())
 }
@@ -274,9 +288,26 @@ async fn get_object(
         return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
     }
 
-    let reader = opendal_operator
-        .reader(&format!("{}/{}/{}", namespace, bucket_name, object_name))
-        .await?;
+    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let metadata = if let Ok(metadata) = opendal_operator.stat(&filepath).await {
+        metadata
+    } else {
+        // maybe actually check if the error is not found :D
+        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
+    };
 
-    Ok(Body::from_stream(reader).into_response())
+    let reader = opendal_operator.reader(&filepath).await?;
+
+    let mut response_headers = HeaderMap::new();
+
+    if let Some(content_type) = metadata.content_type() {
+        response_headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
+    }
+
+    response_headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&metadata.content_length().to_string())?,
+    );
+
+    Ok((response_headers, Body::from_stream(reader)).into_response())
 }

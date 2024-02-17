@@ -7,8 +7,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, Owner};
 use aws_sdk_s3::Client;
 
+/// `setup()` is used to prepare the environment and spawn the child process for the test cases.
 fn setup() -> std::io::Result<Child> {
-    // let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
     let path = assert_cmd::cargo::cargo_bin(env!("CARGO_PKG_NAME"));
 
     let process = Command::new(path)
@@ -44,11 +44,12 @@ async fn test_it_runs() {
     let _ = create_bucket_req2.send().await;
     let list_bucket_res = list_bucket_req.send().await;
 
-    let body = ByteStream::from_path(Path::new("run.sh")).await;
+    let body = ByteStream::from_path(Path::new("Cargo.toml")).await;
     let put_object_res = client
         .put_object()
         .bucket("testing2")
-        .key("run.sh")
+        .key("Cargo.toml")
+        .content_type("application/toml")
         .body(body.unwrap())
         .send()
         .await;
@@ -56,7 +57,7 @@ async fn test_it_runs() {
     let get_object_res = client
         .get_object()
         .bucket("testing2")
-        .key("run.sh")
+        .key("Cargo.toml")
         .send()
         .await;
 
@@ -83,9 +84,13 @@ async fn test_it_runs() {
 
     assert_eq!(buckets, expected_buckets);
     assert_eq!(owner, Some(&expected_owner));
-    assert!(put_object_res.is_ok());
+    put_object_res.unwrap();
 
     let response = get_object_res.unwrap();
+    let content_type = response.content_type();
+    let content_length = response.content_length();
+    assert_eq!(Some("application/toml"), content_type);
+    assert!(content_length.is_some());
     let body = String::from_utf8(response.body.collect().await.unwrap().to_vec()).unwrap();
-    assert!(body.contains("cargo run"));
+    assert!(body.contains("s3-proxy"));
 }
