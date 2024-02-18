@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::signature::VerifiedRequest;
 use crate::{templates, AppState};
 use axum::body::Body;
@@ -6,6 +8,7 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum_route_error::RouteError;
+use opendal::Metakey;
 use tokio_stream::StreamExt;
 
 pub async fn list_buckets(
@@ -167,4 +170,59 @@ pub async fn get_object(
     );
 
     Ok((response_headers, Body::from_stream(reader)).into_response())
+}
+
+pub async fn list_objects(
+    Path(bucket_name): Path<String>,
+    State(AppState {
+        opendal_operator, ..
+    }): State<AppState>,
+    signature: VerifiedRequest,
+) -> Result<impl IntoResponse, RouteError> {
+    let namespace = &signature.namespace;
+
+    let mut lister = opendal_operator
+        .lister_with(&format!("{}/{}/", namespace, bucket_name))
+        .recursive(true)
+        .metakey(Metakey::ContentLength | Metakey::Etag | Metakey::LastModified)
+        .await?;
+
+    let mut objects = Vec::new();
+    while let Some(entry) = lister.next().await {
+        match entry {
+            Ok(x) => {
+                let metadata = x.metadata();
+                if metadata.is_file() {
+                    let key = x.name().to_string().into();
+                    let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
+                    let last_modified = metadata
+                        .last_modified()
+                        .map(|dt| Cow::from(dt.to_rfc3339()));
+                    let size = metadata.content_length();
+                    objects.push(templates::ListObjectItem {
+                        key,
+                        etag,
+                        last_modified,
+                        size,
+                    })
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}", e.to_string());
+                return Err(RouteError::new_internal_server());
+            }
+        }
+    }
+
+    let template = templates::ListObjectsTemplate {
+        objects,
+        is_truncated: false,
+        marker: Cow::from(""),
+        next_marker: Cow::from(""),
+        bucket_name: Cow::from(bucket_name),
+        prefix: Cow::from(""),
+        max_keys: 1000,
+    };
+
+    Ok(askama_axum::into_response(&template))
 }

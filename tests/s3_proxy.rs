@@ -54,6 +54,8 @@ async fn test_it_runs() {
         .send()
         .await;
 
+    let list_object_res = client.list_objects().bucket("testing2").send().await;
+
     let get_object_res = client
         .get_object()
         .bucket("testing2")
@@ -85,6 +87,9 @@ async fn test_it_runs() {
     assert_eq!(buckets, expected_buckets);
     assert_eq!(owner, Some(&expected_owner));
     put_object_res.unwrap();
+
+    let _response = list_object_res.unwrap();
+    // do assertions here of list
 
     let response = get_object_res.unwrap();
     let content_type = response.content_type();

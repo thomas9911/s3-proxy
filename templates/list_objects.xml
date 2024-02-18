@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult>
+    <IsTruncated>{{ is_truncated }}</IsTruncated>
+    <Marker>{{ marker }}</Marker>
+    <NextMarker>{{ next_marker }}</NextMarker>
+    <Name>{{ bucket_name }}</Name>
+    <Prefix>{{ prefix }}</Prefix>
+    <MaxKeys>{{ max_keys }}</MaxKeys>
+    <EncodingType>url</EncodingType>
+{%- for object in objects -%}
+    <Contents>
+        {%- match object.etag -%}
+            {%- when Some with (etag) -%}
+         <ETag>"{{ etag }}"</ETag>
+            {%- when None -%}
+         {%- endmatch -%}
+        <Key>{{ object.key }}</Key>
+        {%- match object.last_modified -%}
+            {%- when Some with (last_modified) -%}
+        <LastModified>{{ last_modified }}</LastModified>
+            {%- when None -%}
+         {%- endmatch -%}
+        <Size>{{ object.size }}</Size>
+        <StorageClass>STANDARD</StorageClass>
+   </Contents>  
+{%- endfor -%}
+</ListBucketResult>

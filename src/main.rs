@@ -1,6 +1,7 @@
+use crate::axum_ext::RouterExt;
 use axum::extract::State;
 use axum::response::{IntoResponse, Json};
-use axum::routing::{get, put};
+use axum::routing::get;
 use axum::Router;
 use axum_route_error::RouteError;
 use deadpool_redis::redis::AsyncCommands;
@@ -16,6 +17,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Level;
 
 mod api;
+mod axum_ext;
 mod signature;
 mod templates;
 
@@ -110,7 +112,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/_metadata", get(asdfg))
         .route("/", get(api::list_buckets))
-        .route("/:bucket_name/", put(api::create_bucket))
+        .directory_route(
+            "/:bucket_name",
+            get(api::list_objects).put(api::create_bucket),
+        )
         .route(
             "/:bucket_name/:object_name",
             get(api::get_object).put(api::create_object),
