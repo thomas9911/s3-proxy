@@ -8,13 +8,13 @@ use aws_sigv4::http_request::{
 use aws_sigv4::sign::v4::SigningParams;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request};
+use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
 use deadpool_redis::redis::{AsyncCommands, RedisError};
 use deadpool_redis::PoolError;
 use std::convert::Infallible;
 use std::time::SystemTime;
 use time::error::Parse;
-
 use tracing::error;
 
 #[derive(Debug, Default, PartialEq)]
@@ -236,7 +236,7 @@ pub fn verify_headers(
 pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params> {
     let mut params = S3V4Params::default();
     let authorization = header_map
-        .get("authorization")
+        .get(AUTHORIZATION)
         .and_then(|x| x.to_str().ok())?;
     let (_, rest) = authorization.split_once(" ")?;
 
