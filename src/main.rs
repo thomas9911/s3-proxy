@@ -6,7 +6,7 @@ use axum::Router;
 use axum_route_error::RouteError;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
-use opendal::Operator;
+use opendal::{Operator, Scheme};
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -100,6 +100,36 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args();
+
+    if args.find(|x| x == "--backends").is_some() {
+        let mut schemes: Vec<_> = opendal::Scheme::enabled().into_iter().collect();
+        schemes.sort_by_key(|x| x.into_static());
+
+        for scheme in schemes {
+            if scheme == Scheme::Ghac {
+                continue;
+            }
+            let map = HashMap::from([
+                ("root".to_string(), "/tmp".to_string()),
+                ("container".to_string(), "tmp".to_string()),
+                ("filesystem".to_string(), "tmp".to_string()),
+                ("bucket".to_string(), "tmp".to_string()),
+                ("region".to_string(), "eu-west1".to_string()),
+                ("endpoint".to_string(), "127.0.0.1".to_string()),
+                ("account_name".to_string(), "abc".to_string()),
+                ("access_key_id".to_string(), "abc".to_string()),
+                ("secret_access_key".to_string(), "abc".to_string()),
+            ]);
+    
+            let cap = Operator::via_map(scheme, map).map(|x| x.info().full_capability())?;
+            if cap.list && cap.write && cap.read && cap.create_dir {
+                println!("{} => {:?}", scheme, cap)
+            }
+        }
+        return Ok(())
+    }
+
     let config = Config::from_env()?;
     tracing_subscriber::fmt()
         .with_max_level(Level::ERROR)
