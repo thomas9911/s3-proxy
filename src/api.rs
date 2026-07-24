@@ -24,15 +24,6 @@ pub async fn list_buckets(
 ) -> Result<impl IntoResponse, RouteError> {
     let namespace = &signature.namespace;
 
-    // let bucket = "testing";
-
-    // opendal_operator
-    //     .write(
-    //         &format!("{}/{}/testing.bin", namespace, bucket),
-    //         vec![0; 4096],
-    //     )
-    //     .await?;
-
     let mut lister = opendal_operator
         .lister_with(&format!("{}/", namespace))
         .await?;
@@ -40,37 +31,24 @@ pub async fn list_buckets(
     let mut buckets = Vec::new();
     while let Some(entry) = lister.next().await {
         match entry {
-            Ok(x) => {
-                if x.metadata().is_dir() {
+            Ok(entry) => {
+                if entry.metadata().is_dir() {
                     buckets.push(templates::ListBucketItem {
-                        name: x.name().trim_end_matches('/').to_string().into(),
+                        name: entry.name().trim_end_matches('/').to_string().into(),
                         timestamp: None,
                     })
                 }
             }
-            Err(e) => {
-                tracing::error!("{}", e.to_string());
+            Err(error) => {
+                tracing::error!("{}", error);
                 return Err(RouteError::new_internal_server());
             }
         }
     }
 
-    // let datetime = OffsetDateTime::from_unix_timestamp(1706911595)?;
-    // let tmp_timestamp = datetime.format(&Rfc3339).unwrap();
-
     let template = templates::ListBucketsTemplate {
         owner_name: "Testing",
         owner_id: "1",
-        // buckets: vec![
-        //     templates::ListBucketItem {
-        //         name: "testing1".into(),
-        //         timestamp: Some(tmp_timestamp.into()),
-        //     },
-        //     templates::ListBucketItem {
-        //         name: "testing2".into(),
-        //         timestamp: None,
-        //     },
-        // ],
         buckets,
     };
 
@@ -550,13 +528,13 @@ pub async fn list_objects(
     let mut objects = Vec::new();
     while let Some(entry) = lister.next().await {
         match entry {
-            Ok(x) => {
-                let metadata = x.metadata();
+            Ok(entry) => {
+                let metadata = entry.metadata();
                 if metadata.is_file() {
-                    let key = x
+                    let key = entry
                         .path()
                         .strip_prefix(&format!("{}/{}/", namespace, bucket_name))
-                        .unwrap_or(x.path())
+                        .unwrap_or(entry.path())
                         .to_string()
                         .into();
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
@@ -572,8 +550,8 @@ pub async fn list_objects(
                     })
                 }
             }
-            Err(e) => {
-                tracing::error!("{}", e.to_string());
+            Err(error) => {
+                tracing::error!("{}", error);
                 return Err(RouteError::new_internal_server());
             }
         }

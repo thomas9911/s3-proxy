@@ -32,7 +32,6 @@ use time::{format_description, macros, PrimitiveDateTime};
 
 use crate::AppState;
 
-// const DATE_TIME_FORMAT: &str = "[year][month][day]T[hour][minute][second]Z";
 const DATE_TIME_FORMAT: format_description::StaticFormatDescription =
     macros::format_description!("[year][month][day]T[hour][minute][second]Z");
 
@@ -201,7 +200,6 @@ pub fn verify_headers(
         _ => SignableBody::Bytes(bytes),
     };
 
-    // the same as aws list bucket request found via tracing
     let mut settings = SigningSettings::default();
     settings.percent_encoding_mode = PercentEncodingMode::Single;
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
@@ -265,12 +263,12 @@ pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params<'
 
         match item.split_once("=") {
             Some(("Credential", credential_string)) => {
-                let mut asdf = credential_string.split('/');
-                params.access_key = asdf.next()?;
-                params.date = asdf.next()?;
-                params.region = asdf.next()?;
-                params.service = asdf.next()?;
-                params.postfix = asdf.next()?;
+                let mut credential_parts = credential_string.split('/');
+                params.access_key = credential_parts.next()?;
+                params.date = credential_parts.next()?;
+                params.region = credential_parts.next()?;
+                params.service = credential_parts.next()?;
+                params.postfix = credential_parts.next()?;
             }
             Some(("SignedHeaders", headers)) => {
                 params.signed_headers = headers.split(';').collect();
@@ -282,9 +280,7 @@ pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params<'
         }
     }
 
-    // validations
-
-    if params.access_key == "" {
+    if params.access_key.is_empty() {
         return None;
     }
     if params
@@ -298,7 +294,7 @@ pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params<'
     if params
         .signed_headers
         .iter()
-        .any(|x| !header_map.contains_key(*x))
+        .any(|header| !header_map.contains_key(*header))
     {
         return None;
     }

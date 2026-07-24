@@ -88,7 +88,7 @@ impl AppState {
 
         anyhow::ensure!(maybe_pool.is_some(), "Unable to create metadata pool");
 
-        let operator = Operator::via_map(config.opendal_provider.clone(), config.opendal.clone())?;
+        let operator = Operator::via_map(config.opendal_provider, config.opendal.clone())?;
 
         Ok(AppState {
             metadata_pool: maybe_pool.expect("pool checked is not none earlier"),
@@ -102,9 +102,9 @@ impl AppState {
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args();
 
-    if args.find(|x| x == "--backends").is_some() {
+    if args.find(|arg| arg == "--backends").is_some() {
         let mut schemes: Vec<_> = opendal::Scheme::enabled().into_iter().collect();
-        schemes.sort_by_key(|x| x.into_static());
+        schemes.sort_by_key(|scheme| scheme.into_static());
 
         for scheme in schemes {
             if scheme == Scheme::Ghac {
@@ -122,7 +122,8 @@ async fn main() -> anyhow::Result<()> {
                 ("secret_access_key".to_string(), "abc".to_string()),
             ]);
 
-            let cap = Operator::via_map(scheme, map).map(|x| x.info().full_capability())?;
+            let cap =
+                Operator::via_map(scheme, map).map(|operator| operator.info().full_capability())?;
             if cap.list && cap.write && cap.read && cap.create_dir {
                 println!("{} => {:?}", scheme, cap)
             }
@@ -138,9 +139,8 @@ async fn main() -> anyhow::Result<()> {
     let server_host = config.server_host.clone();
     let app_state = AppState::from_config(config)?;
 
-    // build our application with a single route
     let app = Router::new()
-        .route("/_metadata", get(asdfg))
+        .route("/_metadata", get(metadata_debug))
         .route("/", get(api::list_buckets))
         .directory_route(
             "/:bucket_name",
@@ -165,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn asdfg(
+async fn metadata_debug(
     State(AppState { metadata_pool, .. }): State<AppState>,
 ) -> Result<impl IntoResponse, RouteError> {
     let mut conn = metadata_pool.get().await?;

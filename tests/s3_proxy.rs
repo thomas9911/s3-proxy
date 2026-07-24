@@ -17,8 +17,6 @@ fn setup() -> std::io::Result<Child> {
         .env("S3_PROXY__OPENDAL__ROOT", "/tmp")
         .spawn();
 
-    // tracing_subscriber::fmt().with_max_level(tracing::Level::TRACE).init();
-
     process
 }
 
@@ -64,6 +62,7 @@ async fn test_it_runs() {
         .await;
 
     process.kill().expect("command couldn't be killed");
+    process.wait().expect("command couldn't be waited on");
 
     let out = list_bucket_res.unwrap();
 
@@ -71,7 +70,6 @@ async fn test_it_runs() {
     let expected_buckets = vec![
         Bucket::builder()
             .set_name(Some("testing".to_string()))
-            // .set_creation_date(Some(DateTime::from_secs(1706911595)))
             .build(),
         Bucket::builder()
             .set_name(Some("testing2".to_string()))
@@ -89,8 +87,6 @@ async fn test_it_runs() {
     put_object_res.unwrap();
 
     let _response = list_object_res.unwrap();
-    // do assertions here of list
-
     let response = get_object_res.unwrap();
     let content_type = response.content_type();
     let content_length = response.content_length();
