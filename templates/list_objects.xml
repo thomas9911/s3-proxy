@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
     <IsTruncated>{{ is_truncated }}</IsTruncated>
-    <Marker>{{ marker }}</Marker>
-    <NextMarker>{{ next_marker }}</NextMarker>
+    <ContinuationToken>{{ continuation_token }}</ContinuationToken>
+    <NextContinuationToken>{{ next_continuation_token }}</NextContinuationToken>
+    <KeyCount>{{ key_count }}</KeyCount>
     <Name>{{ bucket_name }}</Name>
     <Prefix>{{ prefix }}</Prefix>
     <MaxKeys>{{ max_keys }}</MaxKeys>
-    <EncodingType>url</EncodingType>
 {%- for object in objects -%}
     <Contents>
         {%- match object.etag -%}

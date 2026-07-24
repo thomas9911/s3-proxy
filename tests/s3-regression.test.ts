@@ -215,7 +215,7 @@ beforeAll(async () => {
 	await startTarget();
 	reportTargetVersion();
 	s3 = client();
-});
+}, 60_000);
 afterAll(async () => {
 	s3?.destroy();
 	proxyProcess?.kill();
@@ -260,6 +260,59 @@ describe("S3 compatibility contract", () => {
 		expect(result.stdout).toContain("hello.txt");
 		const cat = await rclone(["cat", `regression:${bucket}/${objectKey}`]);
 		expect(cat.stdout).toBe(objectBody.trim());
+	});
+
+	test("lists 2000 objects through paginated responses", async () => {
+		const objects = Array.from({ length: 2000 }, (_, index) => ({
+			Key: `bulk/${index.toString().padStart(4, "0")}.txt`,
+			Body: `bulk object ${index}`,
+		}));
+		for (let offset = 0; offset < objects.length; offset += 50) {
+			await Promise.all(
+				objects
+					.slice(offset, offset + 50)
+					.map((object) =>
+						s3.send(new PutObjectCommand({ Bucket: bucket, ...object })),
+					),
+			);
+		}
+
+		const keys: string[] = [];
+		let continuationToken: string | undefined;
+		let pageCount = 0;
+		do {
+			const page = await s3.send(
+				new ListObjectsV2Command({
+					Bucket: bucket,
+					Prefix: "bulk/",
+					MaxKeys: 1000,
+					ContinuationToken: continuationToken,
+				}),
+			);
+			pageCount += 1;
+			keys.push(
+				...(page.Contents?.flatMap((object) =>
+					object.Key ? [object.Key] : [],
+				) ?? []),
+			);
+			continuationToken = page.NextContinuationToken;
+		} while (continuationToken);
+
+		expect(pageCount).toBe(2);
+		expect(keys).toHaveLength(2000);
+		expect(new Set(keys).size).toBe(2000);
+		expect(keys).toContain("bulk/0000.txt");
+		expect(keys).toContain("bulk/1999.txt");
+
+		for (let offset = 0; offset < objects.length; offset += 50) {
+			await Promise.all(
+				objects
+					.slice(offset, offset + 50)
+					.map(({ Key }) =>
+						s3.send(new DeleteObjectCommand({ Bucket: bucket, Key })),
+					),
+			);
+		}
 	});
 
 	test("returns S3 errors for missing resources", async () => {

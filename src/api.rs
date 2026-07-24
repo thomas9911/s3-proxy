@@ -4,7 +4,7 @@ use crate::signature::{s3_error_response, VerifiedRequest};
 use crate::{templates, AppState};
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
 use axum::body::Body;
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{Multipart, Path, Query, State};
 use axum::http::header::{HeaderName, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
@@ -501,6 +501,7 @@ pub async fn delete_object(
 
 pub async fn list_objects(
     Path(bucket_name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     State(AppState {
         opendal_operator, ..
     }): State<AppState>,
@@ -522,10 +523,21 @@ pub async fn list_objects(
     let mut lister = opendal_operator
         .lister_with(&format!("{}/{}/", namespace, bucket_name))
         .recursive(true)
-        .metakey(Metakey::ContentLength | Metakey::Etag | Metakey::LastModified)
+        .metakey(Metakey::ContentLength)
         .await?;
 
-    let mut objects = Vec::new();
+    let prefix = query.get("prefix").cloned().unwrap_or_default();
+    let max_keys = query
+        .get("max-keys")
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1000)
+        .clamp(1, 1000);
+    let offset = query
+        .get("continuation-token")
+        .map(String::as_str)
+        .and_then(|token| token.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut all_objects = Vec::new();
     while let Some(entry) = lister.next().await {
         match entry {
             Ok(entry) => {
@@ -534,20 +546,20 @@ pub async fn list_objects(
                     let key = entry
                         .path()
                         .strip_prefix(&format!("{}/{}/", namespace, bucket_name))
-                        .unwrap_or(entry.path())
-                        .to_string()
-                        .into();
+                        .unwrap_or(entry.path());
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
                     let last_modified = metadata
                         .last_modified()
                         .map(|dt| Cow::from(dt.to_rfc3339()));
                     let size = metadata.content_length();
-                    objects.push(templates::ListObjectItem {
-                        key,
-                        etag,
-                        last_modified,
-                        size,
-                    })
+                    if key.starts_with(&prefix) {
+                        all_objects.push(templates::ListObjectItem {
+                            key: Cow::Owned(key.to_string()),
+                            etag,
+                            last_modified,
+                            size,
+                        });
+                    }
                 }
             }
             Err(error) => {
@@ -557,14 +569,34 @@ pub async fn list_objects(
         }
     }
 
+    all_objects.sort_by(|left, right| left.key.cmp(&right.key));
+    let start = offset.min(all_objects.len());
+    let end = (start + max_keys as usize).min(all_objects.len());
+    let is_truncated = end < all_objects.len();
+    let next_continuation_token = if is_truncated {
+        end.to_string()
+    } else {
+        String::new()
+    };
+    let objects = all_objects
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .collect();
+
     let template = templates::ListObjectsTemplate {
         objects,
-        is_truncated: false,
-        marker: Cow::from(""),
-        next_marker: Cow::from(""),
+        is_truncated,
+        continuation_token: query
+            .get("continuation-token")
+            .cloned()
+            .unwrap_or_default()
+            .into(),
+        next_continuation_token: next_continuation_token.into(),
+        key_count: (end - start) as u64,
         bucket_name: Cow::from(bucket_name),
-        prefix: Cow::from(""),
-        max_keys: 1000,
+        prefix: prefix.into(),
+        max_keys,
     };
 
     Ok(askama_axum::into_response(&template))

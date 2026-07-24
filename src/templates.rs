@@ -28,8 +28,9 @@ pub struct ListObjectItem<'a> {
 #[template(path = "list_objects.xml")]
 pub struct ListObjectsTemplate<'a> {
     pub is_truncated: bool,
-    pub marker: Cow<'a, str>,
-    pub next_marker: Cow<'a, str>,
+    pub continuation_token: Cow<'a, str>,
+    pub next_continuation_token: Cow<'a, str>,
+    pub key_count: u64,
     pub bucket_name: Cow<'a, str>,
     pub prefix: Cow<'a, str>,
     pub max_keys: u64,
@@ -95,8 +96,9 @@ fn renders_list_objects_xml() {
     ];
     let template = ListObjectsTemplate {
         is_truncated: false,
-        marker: "".into(),
-        next_marker: "".into(),
+        continuation_token: "".into(),
+        next_continuation_token: "".into(),
+        key_count: 2,
         bucket_name: "bucket1".into(),
         prefix: "".into(),
         max_keys: 1000,
