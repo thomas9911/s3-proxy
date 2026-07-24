@@ -28,18 +28,32 @@ pub struct S3V4Params<'a> {
     pub signature: &'a str,
 }
 
-use time::{format_description, PrimitiveDateTime, macros};
+use time::{format_description, macros, PrimitiveDateTime};
 
 use crate::AppState;
 
 // const DATE_TIME_FORMAT: &str = "[year][month][day]T[hour][minute][second]Z";
-const DATE_TIME_FORMAT: format_description::StaticFormatDescription  = macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+const DATE_TIME_FORMAT: format_description::StaticFormatDescription =
+    macros::format_description!("[year][month][day]T[hour][minute][second]Z");
 
 #[derive(Debug, Default, PartialEq)]
 pub struct VerifiedRequest {
     pub access_key: String,
     pub namespace: String,
     pub bytes: Bytes,
+}
+
+pub(crate) fn s3_error_response(status: StatusCode, code: &str, message: &str) -> Response<Body> {
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error><Code>{code}</Code><Message>{message}</Message></Error>"#
+    );
+
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
+        .expect("static S3 error response headers are valid")
 }
 
 pub enum VerifiedRequestError {
@@ -116,9 +130,12 @@ impl FromRequest<AppState> for VerifiedRequest {
         let params = match parse_authorization_header(&header_map) {
             Some(params) => params,
             None => {
-                let mut response = String::from("asdfag").into_response();
-                *response.status_mut() = StatusCode::NOT_FOUND;
-                return Err(response.into());
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "Access Denied",
+                )
+                .into());
             }
         };
 
@@ -127,9 +144,12 @@ impl FromRequest<AppState> for VerifiedRequest {
         {
             Ok(Some(result)) => result,
             Ok(None) => {
-                let mut response = String::from("secret key not found").into_response();
-                *response.status_mut() = StatusCode::NOT_FOUND;
-                return Err(response.into());
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "Access Denied",
+                )
+                .into());
             }
             Err(error) => return Err(VerifiedRequestError::from(error)),
         };
@@ -144,9 +164,12 @@ impl FromRequest<AppState> for VerifiedRequest {
             &secret_key,
             &bytes,
         ) {
-            let mut response = String::from("not allowed :( ").into_response();
-            *response.status_mut() = StatusCode::UNAUTHORIZED;
-            return Err(response.into());
+            return Err(s3_error_response(
+                StatusCode::FORBIDDEN,
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided.",
+            )
+            .into());
         };
 
         Ok(VerifiedRequest {
@@ -159,11 +182,7 @@ impl FromRequest<AppState> for VerifiedRequest {
 
 /// Parses `YYYYMMDD'T'HHMMSS'Z'` formatted dates into a `SystemTime`.
 pub(crate) fn parse_date_time(date_time_str: &str) -> Result<SystemTime, Parse> {
-    let date_time = PrimitiveDateTime::parse(
-        date_time_str,
-        &DATE_TIME_FORMAT,
-    )?
-    .assume_utc();
+    let date_time = PrimitiveDateTime::parse(date_time_str, &DATE_TIME_FORMAT)?.assume_utc();
     Ok(date_time.into())
 }
 

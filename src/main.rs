@@ -121,13 +121,13 @@ async fn main() -> anyhow::Result<()> {
                 ("access_key_id".to_string(), "abc".to_string()),
                 ("secret_access_key".to_string(), "abc".to_string()),
             ]);
-    
+
             let cap = Operator::via_map(scheme, map).map(|x| x.info().full_capability())?;
             if cap.list && cap.write && cap.read && cap.create_dir {
                 println!("{} => {:?}", scheme, cap)
             }
         }
-        return Ok(())
+        return Ok(());
     }
 
     let config = Config::from_env()?;
@@ -144,11 +144,17 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(api::list_buckets))
         .directory_route(
             "/:bucket_name",
-            get(api::list_objects).put(api::create_bucket),
+            get(api::list_objects)
+                .put(api::create_bucket)
+                .delete(api::delete_bucket)
+                .post(api::post_object),
         )
         .route(
-            "/:bucket_name/:object_name",
-            get(api::get_object).put(api::create_object),
+            "/:bucket_name/*object_name",
+            get(api::get_object)
+                .head(api::head_object)
+                .put(api::create_object)
+                .delete(api::delete_object),
         )
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
         .with_state(app_state);

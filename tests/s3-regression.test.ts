@@ -173,6 +173,34 @@ async function startTarget() {
 	await waitForEndpoint();
 }
 
+function reportTargetVersion() {
+	if (target === "minio") {
+		const version = run(
+			["docker", "exec", containerName, "minio", "--version"],
+			{ check: false },
+		);
+		const release =
+			version.stdout.match(/minio version\s+([^\s]+)/i)?.[1] ?? "unknown";
+		console.log(`[s3-regression] target=minio version=${release}`);
+		return;
+	}
+	if (target === "proxy") {
+		const metadata = JSON.parse(
+			run(["cargo", "metadata", "--no-deps", "--format-version", "1"]).stdout,
+		);
+		const packageInfo = metadata.packages.find(
+			(item: { name: string }) => item.name === "s3-proxy",
+		);
+		console.log(
+			`[s3-regression] target=proxy version=${packageInfo?.version ?? "unknown"}`,
+		);
+		return;
+	}
+	console.log(
+		`[s3-regression] target=external version=${process.env.S3_TEST_VERSION ?? "unknown"}`,
+	);
+}
+
 function client() {
 	return new S3Client({
 		endpoint,
@@ -185,6 +213,7 @@ function client() {
 let s3: S3Client;
 beforeAll(async () => {
 	await startTarget();
+	reportTargetVersion();
 	s3 = client();
 });
 afterAll(async () => {
