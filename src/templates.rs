@@ -34,7 +34,7 @@ pub struct ListObjectsTemplate<'a> {
     pub bucket_name: Cow<'a, str>,
     pub prefix: Cow<'a, str>,
     pub max_keys: u64,
-    pub objects: Vec<ListObjectItem<'a>>,
+    pub objects: &'a [ListObjectItem<'a>],
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -102,7 +102,7 @@ fn renders_list_objects_xml() {
         bucket_name: "bucket1".into(),
         prefix: "".into(),
         max_keys: 1000,
-        objects,
+        objects: &objects,
     };
     let template_str = template.render().expect("Unable to render template");
     assert!(template_str.contains("fba9dede5f27731c9771645a39863328"));

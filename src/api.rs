@@ -526,7 +526,10 @@ pub async fn list_objects(
         .metakey(Metakey::ContentLength)
         .await?;
 
-    let prefix = query.get("prefix").cloned().unwrap_or_default();
+    let prefix = query
+        .get("prefix")
+        .map(Cow::from)
+        .unwrap_or(Cow::Borrowed(""));
     let max_keys = query
         .get("max-keys")
         .and_then(|value| value.parse::<u64>().ok())
@@ -552,7 +555,7 @@ pub async fn list_objects(
                         .last_modified()
                         .map(|dt| Cow::from(dt.to_rfc3339()));
                     let size = metadata.content_length();
-                    if key.starts_with(&prefix) {
+                    if key.starts_with(prefix.as_ref()) {
                         all_objects.push(templates::ListObjectItem {
                             key: Cow::Owned(key.to_string()),
                             etag,
@@ -574,25 +577,20 @@ pub async fn list_objects(
     let end = (start + max_keys as usize).min(all_objects.len());
     let is_truncated = end < all_objects.len();
     let next_continuation_token = if is_truncated {
-        end.to_string()
+        Cow::Owned(end.to_string())
     } else {
-        String::new()
+        Cow::Borrowed("")
     };
-    let objects = all_objects
-        .into_iter()
-        .skip(start)
-        .take(end - start)
-        .collect();
+    let objects = &all_objects[start..end];
 
     let template = templates::ListObjectsTemplate {
         objects,
         is_truncated,
         continuation_token: query
             .get("continuation-token")
-            .cloned()
-            .unwrap_or_default()
-            .into(),
-        next_continuation_token: next_continuation_token.into(),
+            .map(Cow::from)
+            .unwrap_or(Cow::Borrowed("")),
+        next_continuation_token: next_continuation_token,
         key_count: (end - start) as u64,
         bucket_name: Cow::from(bucket_name),
         prefix: prefix.into(),
