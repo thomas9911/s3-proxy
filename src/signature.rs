@@ -28,11 +28,12 @@ pub struct S3V4Params<'a> {
     pub signature: &'a str,
 }
 
-use time::{format_description, PrimitiveDateTime};
+use time::{format_description, PrimitiveDateTime, macros};
 
 use crate::AppState;
 
-const DATE_TIME_FORMAT: &str = "[year][month][day]T[hour][minute][second]Z";
+// const DATE_TIME_FORMAT: &str = "[year][month][day]T[hour][minute][second]Z";
+const DATE_TIME_FORMAT: format_description::StaticFormatDescription  = macros::format_description!("[year][month][day]T[hour][minute][second]Z");
 
 #[derive(Debug, Default, PartialEq)]
 pub struct VerifiedRequest {
@@ -160,7 +161,7 @@ impl FromRequest<AppState> for VerifiedRequest {
 pub(crate) fn parse_date_time(date_time_str: &str) -> Result<SystemTime, Parse> {
     let date_time = PrimitiveDateTime::parse(
         date_time_str,
-        &format_description::parse(DATE_TIME_FORMAT).unwrap(),
+        &DATE_TIME_FORMAT,
     )?
     .assume_utc();
     Ok(date_time.into())
@@ -233,7 +234,7 @@ pub fn verify_headers(
     false
 }
 
-pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params> {
+pub fn parse_authorization_header(header_map: &HeaderMap) -> Option<S3V4Params<'_>> {
     let mut params = S3V4Params::default();
     let authorization = header_map
         .get(AUTHORIZATION)
