@@ -98,10 +98,36 @@ impl AppState {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args().any(|arg| arg == "--backends") {
-        let operator = Operator::via_iter("memory", HashMap::new())?;
-        let capability = operator.info().full_capability();
-        if capability.list && capability.write && capability.read && capability.create_dir {
-            println!("memory => {:?}", capability);
+        let backends = [
+            (
+                "fs",
+                HashMap::from([("root".to_string(), "/tmp".to_string())]),
+            ),
+            ("memory", HashMap::new()),
+            (
+                "s3",
+                HashMap::from([
+                    ("bucket".to_string(), "tmp".to_string()),
+                    ("endpoint".to_string(), "http://127.0.0.1:9000".to_string()),
+                    ("access_key_id".to_string(), "abc".to_string()),
+                    ("secret_access_key".to_string(), "abc".to_string()),
+                    ("region".to_string(), "us-east-1".to_string()),
+                ]),
+            ),
+        ];
+
+        for (scheme, options) in backends {
+            match Operator::via_iter(scheme, options) {
+                Ok(operator) => {
+                    let capability = operator.info().full_capability();
+                    println!(
+                        "{scheme} => proxy_compatibility={} {:?}",
+                        proxy_compatibility(&capability),
+                        capability
+                    );
+                }
+                Err(error) => println!("{scheme} => unavailable: {error}"),
+            }
         }
         return Ok(());
     }
@@ -138,6 +164,38 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+fn proxy_compatibility(capability: &opendal::Capability) -> &'static str {
+    if supports_proxy(capability) {
+        "full"
+    } else if supports_partial_proxy(capability) {
+        "partial"
+    } else {
+        "none"
+    }
+}
+
+fn supports_proxy(capability: &opendal::Capability) -> bool {
+    capability.stat
+        && capability.read
+        && capability.write
+        && capability.write_can_empty
+        && capability.write_with_content_type
+        && capability.create_dir
+        && capability.delete
+        && capability.list
+        && capability.list_with_recursive
+}
+
+fn supports_partial_proxy(capability: &opendal::Capability) -> bool {
+    capability.stat
+        && capability.read
+        && capability.write
+        && capability.write_can_empty
+        && capability.create_dir
+        && capability.delete
+        && capability.list
 }
 
 async fn metadata_debug(
