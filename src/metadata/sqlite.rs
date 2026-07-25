@@ -1,7 +1,7 @@
 use super::{MetadataStore, ObjectMetadata};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 pub struct SqliteMetadataStore {
     pool: SqlitePool,
@@ -76,23 +76,27 @@ impl MetadataStore for SqliteMetadataStore {
         metadata: &ObjectMetadata,
     ) -> anyhow::Result<()> {
         let metadata = metadata.clone().into_map();
-        let mut transaction = self.pool.begin().await?;
-        for (key, value) in metadata {
-            sqlx::query(
-                "INSERT INTO object_metadata
-                    (namespace, bucket, object, metadata_key, metadata_value)
-                 VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT(namespace, bucket, object, metadata_key)
-                 DO UPDATE SET metadata_value = excluded.metadata_value",
-            )
-            .bind(namespace)
-            .bind(bucket)
-            .bind(object)
-            .bind(key)
-            .bind(value)
-            .execute(&mut *transaction)
-            .await?;
+        if metadata.is_empty() {
+            return Ok(());
         }
+
+        let mut transaction = self.pool.begin().await?;
+        let mut query_builder = QueryBuilder::<Sqlite>::new(
+            "INSERT INTO object_metadata
+                (namespace, bucket, object, metadata_key, metadata_value) ",
+        );
+        query_builder.push_values(metadata, |mut row, (key, value)| {
+            row.push_bind(namespace)
+                .push_bind(bucket)
+                .push_bind(object)
+                .push_bind(key)
+                .push_bind(value);
+        });
+        query_builder.push(
+            " ON CONFLICT(namespace, bucket, object, metadata_key)
+              DO UPDATE SET metadata_value = excluded.metadata_value",
+        );
+        query_builder.build().execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(())
     }
