@@ -22,7 +22,33 @@ deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1", "serde"] }
 headers = "0.4.1"
 opendal = {
     version = "0.57.0",
-    features = ["services-fs", "services-memory", "services-s3"],
+    features = [
+        "services-azblob",
+        "services-b2",
+        "services-cloudflare-kv",
+        "services-compfs",
+        "services-cos",
+        "services-dashmap",
+        "services-fs",
+        "services-gcs",
+        "services-github",
+        "services-koofr",
+        "services-memory",
+        "services-mini-moka",
+        "services-moka",
+        "services-mysql",
+        "services-obs",
+        "services-oss",
+        "services-s3",
+        "services-seafile",
+        "services-sled",
+        "services-swift",
+        "services-tos",
+        "services-upyun",
+        "services-vercel-blob",
+        "services-webdav",
+        "services-yandex-disk",
+    ],
 }
 quick-xml = { version = "0.41.0", features = ["serialize", "async-tokio"] }
 serde = { version = "1.0.229", features = ["derive"] }
