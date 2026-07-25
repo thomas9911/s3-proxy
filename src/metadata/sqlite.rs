@@ -1,8 +1,7 @@
-use super::MetadataStore;
+use super::{MetadataStore, ObjectMetadata};
 use async_trait::async_trait;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
 
 pub struct SqliteMetadataStore {
     pool: SqlitePool,
@@ -74,8 +73,9 @@ impl MetadataStore for SqliteMetadataStore {
         namespace: &str,
         bucket: &str,
         object: &str,
-        metadata: &HashMap<String, String>,
+        metadata: &ObjectMetadata,
     ) -> anyhow::Result<()> {
+        let metadata = metadata.clone().into_map();
         let mut transaction = self.pool.begin().await?;
         for (key, value) in metadata {
             sqlx::query(
@@ -102,7 +102,7 @@ impl MetadataStore for SqliteMetadataStore {
         namespace: &str,
         bucket: &str,
         object: &str,
-    ) -> anyhow::Result<HashMap<String, String>> {
+    ) -> anyhow::Result<ObjectMetadata> {
         let rows = sqlx::query_as::<_, (String, String)>(
             "SELECT metadata_key, metadata_value FROM object_metadata
              WHERE namespace = ? AND bucket = ? AND object = ?",
@@ -112,7 +112,25 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(object)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().collect())
+        Ok(ObjectMetadata::from_map(rows.into_iter().collect()))
+    }
+
+    async fn delete_object_metadata(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<()> {
+        sqlx::query(
+            "DELETE FROM object_metadata
+             WHERE namespace = ? AND bucket = ? AND object = ?",
+        )
+        .bind(namespace)
+        .bind(bucket)
+        .bind(object)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
@@ -128,7 +146,7 @@ impl MetadataStore for SqliteMetadataStore {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataStore, SqliteMetadataStore};
+    use super::{MetadataStore, ObjectMetadata, SqliteMetadataStore};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -142,7 +160,12 @@ mod tests {
             Some("secret")
         );
 
-        let metadata = HashMap::from([(String::from("suite"), String::from("sqlite"))]);
+        let metadata = ObjectMetadata {
+            content_type: Some("text/plain".to_string()),
+            content_length: Some(7),
+            user_metadata: HashMap::from([(String::from("suite"), String::from("sqlite"))]),
+            ..Default::default()
+        };
         store
             .set_object_metadata("access", "bucket", "object", &metadata)
             .await

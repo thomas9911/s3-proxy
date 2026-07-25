@@ -1,8 +1,7 @@
-use super::MetadataStore;
+use super::{MetadataStore, ObjectMetadata};
 use async_trait::async_trait;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
-use std::collections::HashMap;
 
 pub struct RedisMetadataStore {
     pool: Pool,
@@ -34,8 +33,9 @@ impl MetadataStore for RedisMetadataStore {
         namespace: &str,
         bucket: &str,
         object: &str,
-        metadata: &HashMap<String, String>,
+        metadata: &ObjectMetadata,
     ) -> anyhow::Result<()> {
+        let metadata = metadata.clone().into_map();
         if metadata.is_empty() {
             return Ok(());
         }
@@ -52,11 +52,26 @@ impl MetadataStore for RedisMetadataStore {
         namespace: &str,
         bucket: &str,
         object: &str,
-    ) -> anyhow::Result<HashMap<String, String>> {
+    ) -> anyhow::Result<ObjectMetadata> {
         let mut connection = self.pool.get().await?;
-        Ok(connection
-            .hgetall(object_metadata_key(namespace, bucket, object))
-            .await?)
+        Ok(ObjectMetadata::from_map(
+            connection
+                .hgetall(object_metadata_key(namespace, bucket, object))
+                .await?,
+        ))
+    }
+
+    async fn delete_object_metadata(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let _: () = connection
+            .del(object_metadata_key(namespace, bucket, object))
+            .await?;
+        Ok(())
     }
 
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>> {

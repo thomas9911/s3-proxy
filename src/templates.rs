@@ -25,6 +25,11 @@ pub struct ListObjectItem<'a> {
     pub size: u64,
 }
 
+#[derive(Debug)]
+pub struct ListCommonPrefix<'a> {
+    pub prefix: Cow<'a, str>,
+}
+
 #[derive(Debug, Template, WebTemplate)]
 #[template(path = "list_objects.xml")]
 pub struct ListObjectsTemplate<'a> {
@@ -36,6 +41,7 @@ pub struct ListObjectsTemplate<'a> {
     pub prefix: Cow<'a, str>,
     pub max_keys: u64,
     pub objects: &'a [ListObjectItem<'a>],
+    pub common_prefixes: &'a [ListCommonPrefix<'a>],
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -104,6 +110,7 @@ fn renders_list_objects_xml() {
         prefix: "".into(),
         max_keys: 1000,
         objects: &objects,
+        common_prefixes: &[],
     };
     let template_str = template.render().expect("Unable to render template");
     assert!(template_str.contains("fba9dede5f27731c9771645a39863328"));

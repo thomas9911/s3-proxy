@@ -84,6 +84,9 @@ pub async fn delete_bucket(
             "The specified bucket does not exist.",
         ));
     }
-    opendal_operator.delete(&bucket_path).await?;
+    opendal_operator
+        .delete_with(&bucket_path)
+        .recursive(true)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

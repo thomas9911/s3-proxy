@@ -36,10 +36,26 @@ run("proxy with Redis", {
 	S3_TEST_TARGET: "proxy",
 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
 	S3_TEST_METADATA_BACKEND: "redis",
+	S3_TEST_OPENDAL_PROVIDER: "memory",
 });
 
 run("proxy with SQLite", {
 	S3_TEST_TARGET: "proxy",
 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
 	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "memory",
+});
+
+run("proxy with FS", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "fs",
+});
+
+run("proxy with Sled", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "sled",
 });

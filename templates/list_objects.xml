@@ -24,4 +24,9 @@
         <StorageClass>STANDARD</StorageClass>
    </Contents>  
 {%- endfor -%}
+{%- for common_prefix in common_prefixes -%}
+    <CommonPrefixes>
+        <Prefix>{{ common_prefix.prefix }}</Prefix>
+    </CommonPrefixes>
+{%- endfor -%}
 </ListBucketResult>

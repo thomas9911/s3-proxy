@@ -18,6 +18,7 @@ const target =
 	process.env.S3_TEST_TARGET ??
 	(process.env.S3_TEST_ENDPOINT ? "external" : "minio");
 const metadataBackend = process.env.S3_TEST_METADATA_BACKEND ?? "redis";
+const opendalProvider = process.env.S3_TEST_OPENDAL_PROVIDER ?? "memory";
 const endpoint = process.env.S3_TEST_ENDPOINT ?? "http://127.0.0.1:19000";
 const accessKeyId = process.env.S3_TEST_ACCESS_KEY ?? "minioadmin";
 const secretAccessKey = process.env.S3_TEST_SECRET_KEY ?? "minioadmin";
@@ -170,8 +171,13 @@ async function startTarget() {
 				...(metadataBackend === "redis"
 					? { S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379" }
 					: { S3_PROXY__SQLITE__URL: sqliteDatabaseUrl }),
-				S3_PROXY__OPENDAL_PROVIDER: "memory",
+				S3_PROXY__OPENDAL_PROVIDER: opendalProvider,
 				S3_PROXY__OPENDAL__ROOT: "/tmp",
+				...(opendalProvider === "sled"
+					? {
+						S3_PROXY__OPENDAL__DATADIR: `target/s3-regression-sled-${process.pid}`,
+					}
+					: {}),
 			},
 			stdout: "ignore",
 			stderr: "pipe",
@@ -344,7 +350,7 @@ describe("S3 compatibility contract", () => {
 					),
 			);
 		}
-	});
+	}, 30_000);
 
 	test("returns S3 errors for missing resources", async () => {
 		await expectS3Error(

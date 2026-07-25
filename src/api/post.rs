@@ -1,5 +1,5 @@
 use crate::signature::s3_error_response;
-use crate::AppState;
+use crate::{metadata::ObjectMetadata, AppState};
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
 use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
@@ -160,12 +160,34 @@ pub async fn post_object(
             "Missing file",
         ));
     };
+    let content_length = file.len() as u64;
+    let content_type = fields.get("content-type").cloned();
     let filepath = format!("{access_key}/{bucket_name}/{key}");
     let mut writer = opendal_operator.write_with(&filepath, file);
-    if let Some(content_type) = fields.get("content-type") {
+    if let Some(content_type) = content_type.as_deref() {
         writer = writer.content_type(content_type);
     }
     writer.await?;
+    let user_metadata = fields
+        .iter()
+        .filter_map(|(name, value)| {
+            name.strip_prefix("x-amz-meta-")
+                .map(|key| (key.to_string(), value.to_string()))
+        })
+        .collect();
+    metadata_store
+        .set_object_metadata(
+            access_key,
+            &bucket_name,
+            &key,
+            &ObjectMetadata {
+                content_type,
+                content_length: Some(content_length),
+                user_metadata,
+                ..Default::default()
+            },
+        )
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
