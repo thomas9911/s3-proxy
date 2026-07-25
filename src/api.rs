@@ -10,7 +10,6 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum_route_error::RouteError;
 use base64::Engine;
-use deadpool_redis::redis::AsyncCommands;
 use opendal::Metakey;
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -101,7 +100,7 @@ pub async fn delete_bucket(
 pub async fn post_object(
     Path(bucket_name): Path<String>,
     State(AppState {
-        metadata_pool,
+        metadata_store,
         opendal_operator,
         ..
     }): State<AppState>,
@@ -143,8 +142,7 @@ pub async fn post_object(
         ));
     }
 
-    let mut conn = metadata_pool.get().await?;
-    let secret_key: Option<String> = conn.get(format!("secret_key::{access_key}")).await?;
+    let secret_key = metadata_store.secret_key(access_key).await?;
     let Some(secret_key) = secret_key else {
         return Ok(s3_error_response(
             StatusCode::FORBIDDEN,
@@ -307,7 +305,7 @@ pub async fn create_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
     header_map: HeaderMap,
     State(AppState {
-        metadata_pool,
+        metadata_store,
         opendal_operator,
         ..
     }): State<AppState>,
@@ -355,13 +353,8 @@ pub async fn create_object(
         })
         .collect();
     if !metadata.is_empty() {
-        let mut conn = metadata_pool.get().await?;
-        let items: Vec<_> = metadata.iter().collect();
-        let _: () = conn
-            .hset_multiple(
-                object_metadata_key(&namespace, &bucket_name, &object_name),
-                &items,
-            )
+        metadata_store
+            .set_object_metadata(&namespace, &bucket_name, &object_name, &metadata)
             .await?;
     }
 
@@ -371,7 +364,7 @@ pub async fn create_object(
 pub async fn get_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
     State(AppState {
-        metadata_pool,
+        metadata_store,
         opendal_operator,
         ..
     }): State<AppState>,
@@ -410,7 +403,7 @@ pub async fn get_object(
     }
     add_user_metadata(
         &mut response_headers,
-        metadata_pool,
+        metadata_store,
         &namespace,
         &bucket_name,
         &object_name,
@@ -428,7 +421,7 @@ pub async fn get_object(
 pub async fn head_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
     State(AppState {
-        metadata_pool,
+        metadata_store,
         opendal_operator,
         ..
     }): State<AppState>,
@@ -465,7 +458,7 @@ pub async fn head_object(
     }
     add_user_metadata(
         &mut headers,
-        metadata_pool,
+        metadata_store,
         &namespace,
         &bucket_name,
         &object_name,
@@ -590,30 +583,25 @@ pub async fn list_objects(
             .get("continuation-token")
             .map(Cow::from)
             .unwrap_or(Cow::Borrowed("")),
-        next_continuation_token: next_continuation_token,
+        next_continuation_token,
         key_count: (end - start) as u64,
         bucket_name: Cow::from(bucket_name),
-        prefix: prefix.into(),
+        prefix,
         max_keys,
     };
 
     Ok(askama_axum::into_response(&template))
 }
 
-fn object_metadata_key(namespace: &str, bucket: &str, object: &str) -> String {
-    format!("object_metadata::{namespace}/{bucket}/{object}")
-}
-
 async fn add_user_metadata(
     headers: &mut HeaderMap,
-    metadata_pool: deadpool_redis::Pool,
+    metadata_store: std::sync::Arc<dyn crate::metadata::MetadataStore>,
     namespace: &str,
     bucket: &str,
     object: &str,
 ) -> Result<(), RouteError> {
-    let mut conn = metadata_pool.get().await?;
-    let metadata: HashMap<String, String> = conn
-        .hgetall(object_metadata_key(namespace, bucket, object))
+    let metadata = metadata_store
+        .object_metadata(namespace, bucket, object)
         .await?;
     for (key, value) in metadata {
         headers.insert(

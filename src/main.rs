@@ -4,20 +4,18 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use axum_route_error::RouteError;
-use deadpool_redis::redis::AsyncCommands;
-use deadpool_redis::Pool;
 use opendal::{Operator, Scheme};
 use serde::{Deserialize, Deserializer};
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::Level;
 
 mod api;
 mod axum_ext;
+mod metadata;
 mod signature;
 mod templates;
 
@@ -27,10 +25,18 @@ pub struct Config {
     pub server_host: String,
     #[serde(default = "default_external_host")]
     pub external_server_host: String,
+    #[serde(default = "default_metadata_backend")]
+    pub metadata_backend: String,
     pub redis: Option<deadpool_redis::Config>,
+    pub sqlite: Option<SqliteConfig>,
     #[serde(deserialize_with = "scheme_opendal")]
     pub opendal_provider: opendal::Scheme,
     pub opendal: HashMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SqliteConfig {
+    pub url: String,
 }
 
 fn scheme_opendal<'de, D>(deserializer: D) -> Result<opendal::Scheme, D::Error>
@@ -59,6 +65,10 @@ fn default_external_host() -> String {
     String::from("http://0.0.0.0:3000")
 }
 
+fn default_metadata_backend() -> String {
+    String::from("redis")
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, config::ConfigError> {
         let cfg = config::Config::builder()
@@ -71,27 +81,35 @@ impl Config {
 
 #[derive(Clone)]
 pub struct AppState {
-    /// metadata_pool is already an Arc
-    pub metadata_pool: Pool,
+    pub metadata_store: Arc<dyn metadata::MetadataStore>,
     pub config: Arc<Config>,
     /// opendal_operator is already an Arc
     pub opendal_operator: Operator,
 }
 
 impl AppState {
-    pub fn from_config(config: Config) -> anyhow::Result<AppState> {
-        let mut maybe_pool = None;
-
-        if let Some(redis_config) = &config.redis {
-            maybe_pool = Some(redis_config.create_pool(Some(deadpool_redis::Runtime::Tokio1))?);
-        }
-
-        anyhow::ensure!(maybe_pool.is_some(), "Unable to create metadata pool");
-
+    pub async fn from_config(config: Config) -> anyhow::Result<AppState> {
+        let metadata_store: Arc<dyn metadata::MetadataStore> =
+            match config.metadata_backend.as_str() {
+                "redis" => {
+                    let redis_config = config.redis.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Redis metadata configuration is missing")
+                    })?;
+                    let pool = redis_config.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
+                    Arc::new(metadata::RedisMetadataStore::new(pool))
+                }
+                "sqlite" => {
+                    let sqlite_config = config.sqlite.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("SQLite metadata configuration is missing")
+                    })?;
+                    Arc::new(metadata::SqliteMetadataStore::connect(&sqlite_config.url).await?)
+                }
+                backend => anyhow::bail!("Unsupported metadata backend: {backend}"),
+            };
         let operator = Operator::via_map(config.opendal_provider, config.opendal.clone())?;
 
         Ok(AppState {
-            metadata_pool: maybe_pool.expect("pool checked is not none earlier"),
+            metadata_store,
             config: Arc::new(config),
             opendal_operator: operator,
         })
@@ -137,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let server_host = config.server_host.clone();
-    let app_state = AppState::from_config(config)?;
+    let app_state = AppState::from_config(config).await?;
 
     let app = Router::new()
         .route("/_metadata", get(metadata_debug))
@@ -166,19 +184,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn metadata_debug(
-    State(AppState { metadata_pool, .. }): State<AppState>,
+    State(AppState { metadata_store, .. }): State<AppState>,
 ) -> Result<impl IntoResponse, RouteError> {
-    let mut conn = metadata_pool.get().await?;
-    let _: () = conn
-        .set(
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)?
-                .as_secs(),
-            1,
-        )
-        .await?;
-
-    let res: Vec<String> = conn.keys("17068*").await?;
+    let res = metadata_store.debug_keys("17068*").await?;
 
     Ok(Json(res))
 }

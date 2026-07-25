@@ -10,8 +10,6 @@ use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
-use deadpool_redis::redis::{AsyncCommands, RedisError};
-use deadpool_redis::PoolError;
 use std::convert::Infallible;
 use std::time::SystemTime;
 use time::error::Parse;
@@ -57,22 +55,14 @@ pub(crate) fn s3_error_response(status: StatusCode, code: &str, message: &str) -
 
 pub enum VerifiedRequestError {
     FormattedResponse(Response<Body>),
-    Pool(PoolError),
-    Redis(RedisError),
+    Metadata(anyhow::Error),
 }
 
 impl IntoResponse for VerifiedRequestError {
     fn into_response(self) -> Response<Body> {
         match self {
             VerifiedRequestError::FormattedResponse(response) => response,
-            VerifiedRequestError::Pool(error) => {
-                error!("{}", error.to_string());
-
-                let mut response = Response::default();
-                *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                response
-            }
-            VerifiedRequestError::Redis(error) => {
+            VerifiedRequestError::Metadata(error) => {
                 error!("{}", error.to_string());
 
                 let mut response = Response::default();
@@ -95,15 +85,9 @@ impl From<Infallible> for VerifiedRequestError {
     }
 }
 
-impl From<PoolError> for VerifiedRequestError {
-    fn from(value: PoolError) -> Self {
-        VerifiedRequestError::Pool(value)
-    }
-}
-
-impl From<RedisError> for VerifiedRequestError {
-    fn from(value: RedisError) -> Self {
-        VerifiedRequestError::Redis(value)
+impl From<anyhow::Error> for VerifiedRequestError {
+    fn from(value: anyhow::Error) -> Self {
+        VerifiedRequestError::Metadata(value)
     }
 }
 
@@ -112,7 +96,7 @@ impl FromRequest<AppState> for VerifiedRequest {
     type Rejection = VerifiedRequestError;
 
     async fn from_request(req: Request, state: &AppState) -> Result<Self, Self::Rejection> {
-        let metadata_pool = &state.metadata_pool;
+        let metadata_store = &state.metadata_store;
         let config = &state.config;
         let (mut parts, body) = req.into_parts();
         let header_map = HeaderMap::from_request_parts(&mut parts, state).await?;
@@ -138,19 +122,16 @@ impl FromRequest<AppState> for VerifiedRequest {
             }
         };
 
-        let mut conn = metadata_pool.get().await?;
-        let secret_key: String = match conn.get(format!("secret_key::{}", params.access_key)).await
-        {
-            Ok(Some(result)) => result,
-            Ok(None) => {
+        let secret_key = match metadata_store.secret_key(params.access_key).await? {
+            Some(secret_key) => secret_key,
+            None => {
                 return Err(s3_error_response(
                     StatusCode::FORBIDDEN,
                     "AccessDenied",
                     "Access Denied",
                 )
-                .into());
+                .into())
             }
-            Err(error) => return Err(VerifiedRequestError::from(error)),
         };
 
         let external_host = &config.external_server_host;

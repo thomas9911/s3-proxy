@@ -4,6 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"test": "bun test tests/s3-regression.test.ts",
+		"regression": "bun run tests/run-regression.ts",
 		"typecheck": "tsc -p tsconfig.json"
 	},
 	"dependencies": {

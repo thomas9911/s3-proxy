@@ -1,4 +1,6 @@
+import { Database } from "bun:sqlite";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { unlink } from "node:fs/promises";
 import {
 	CreateBucketCommand,
 	DeleteBucketCommand,
@@ -15,6 +17,7 @@ import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 const target =
 	process.env.S3_TEST_TARGET ??
 	(process.env.S3_TEST_ENDPOINT ? "external" : "minio");
+const metadataBackend = process.env.S3_TEST_METADATA_BACKEND ?? "redis";
 const endpoint = process.env.S3_TEST_ENDPOINT ?? "http://127.0.0.1:19000";
 const accessKeyId = process.env.S3_TEST_ACCESS_KEY ?? "minioadmin";
 const secretAccessKey = process.env.S3_TEST_SECRET_KEY ?? "minioadmin";
@@ -24,6 +27,11 @@ const objectKey = "nested/hello.txt";
 const objectBody = "s3-proxy regression test\n";
 const containerName = `s3-proxy-regression-${process.pid}`;
 const redisContainerName = `s3-proxy-regression-redis-${process.pid}`;
+const sqliteDatabasePath = `${process.cwd()}\\target\\s3-regression-${process.pid}.db`;
+const sqliteDatabaseUrl =
+	process.env.S3_TEST_SQLITE_URL ??
+	`sqlite://target/s3-regression-${process.pid}.db`;
+const ownsSqliteDatabase = !process.env.S3_TEST_SQLITE_URL;
 const rcloneBinary = process.env.RCLONE ?? `${process.cwd()}\\rclone.exe`;
 let ownsContainer = false;
 let proxyProcess: Bun.Subprocess | undefined;
@@ -107,40 +115,61 @@ async function startTarget() {
 	}
 
 	if (target === "proxy") {
-		run(["docker", "rm", "-f", redisContainerName], { check: false });
-		run([
-			"docker",
-			"run",
-			"--detach",
-			"--name",
-			redisContainerName,
-			"--publish",
-			"16379:6379",
-			"redis:latest",
-		]);
-		for (let attempt = 0; attempt < 30; attempt++) {
-			const seeded = run(
-				[
-					"docker",
-					"exec",
-					redisContainerName,
-					"redis-cli",
-					"set",
-					`secret_key::${accessKeyId}`,
-					secretAccessKey,
-				],
-				{ check: false },
+		if (metadataBackend === "redis") {
+			run(["docker", "rm", "-f", redisContainerName], { check: false });
+			run([
+				"docker",
+				"run",
+				"--detach",
+				"--name",
+				redisContainerName,
+				"--publish",
+				"16379:6379",
+				"redis:latest",
+			]);
+			for (let attempt = 0; attempt < 30; attempt++) {
+				const seeded = run(
+					[
+						"docker",
+						"exec",
+						redisContainerName,
+						"redis-cli",
+						"set",
+						`secret_key::${accessKeyId}`,
+						secretAccessKey,
+					],
+					{ check: false },
+				);
+				if (seeded.exitCode === 0) break;
+				if (attempt === 29) throw new Error("Redis did not become ready");
+				await sleep(500);
+			}
+		} else if (metadataBackend !== "sqlite") {
+			throw new Error(`unknown metadata backend: ${metadataBackend}`);
+		} else {
+			const database = new Database(sqliteDatabasePath);
+			database.run(`
+				CREATE TABLE IF NOT EXISTS access_keys (
+					access_key TEXT PRIMARY KEY,
+					secret_key TEXT NOT NULL
+				)
+			`);
+			database.run(
+				`INSERT INTO access_keys (access_key, secret_key) VALUES (?, ?)
+				 ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key`,
+				[accessKeyId, secretAccessKey],
 			);
-			if (seeded.exitCode === 0) break;
-			if (attempt === 29) throw new Error("Redis did not become ready");
-			await sleep(500);
+			database.close();
 		}
 		proxyProcess = Bun.spawn(["cargo", "run", "--quiet"], {
 			env: {
 				...process.env,
 				S3_PROXY__SERVER_HOST: "0.0.0.0:19000",
 				S3_PROXY__EXTERNAL_SERVER_HOST: endpoint,
-				S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379",
+				S3_PROXY__METADATA_BACKEND: metadataBackend,
+				...(metadataBackend === "redis"
+					? { S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379" }
+					: { S3_PROXY__SQLITE__URL: sqliteDatabaseUrl }),
 				S3_PROXY__OPENDAL_PROVIDER: "memory",
 				S3_PROXY__OPENDAL__ROOT: "/tmp",
 			},
@@ -223,6 +252,8 @@ afterAll(async () => {
 		run(["docker", "rm", "--force", containerName], { check: false });
 	if (target === "proxy")
 		run(["docker", "rm", "--force", redisContainerName], { check: false });
+	if (target === "proxy" && ownsSqliteDatabase)
+		await unlink(sqliteDatabasePath).catch(() => {});
 });
 
 describe("S3 compatibility contract", () => {
