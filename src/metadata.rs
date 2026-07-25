@@ -2,10 +2,10 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 
 mod redis;
-mod sqlite;
+mod sql;
 
 pub use redis::RedisMetadataStore;
-pub use sqlite::SqliteMetadataStore;
+pub use sql::{PostgresMetadataStore, SqliteMetadataStore};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectMetadata {

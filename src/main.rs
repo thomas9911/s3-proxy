@@ -28,12 +28,18 @@ pub struct Config {
     pub metadata_backend: String,
     pub redis: Option<deadpool_redis::Config>,
     pub sqlite: Option<SqliteConfig>,
+    pub postgres: Option<PostgresConfig>,
     pub opendal_provider: String,
     pub opendal: HashMap<String, String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SqliteConfig {
+    pub url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct PostgresConfig {
     pub url: String,
 }
 
@@ -83,6 +89,12 @@ impl AppState {
                         anyhow::anyhow!("SQLite metadata configuration is missing")
                     })?;
                     Arc::new(metadata::SqliteMetadataStore::connect(&sqlite_config.url).await?)
+                }
+                "postgres" => {
+                    let postgres_config = config.postgres.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("PostgreSQL metadata configuration is missing")
+                    })?;
+                    Arc::new(metadata::PostgresMetadataStore::connect(&postgres_config.url).await?)
                 }
                 backend => anyhow::bail!("Unsupported metadata backend: {backend}"),
             };

@@ -1,25 +1,26 @@
 use super::{MetadataStore, ObjectMetadata};
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::any::AnyPoolOptions;
+use sqlx::{AnyPool, AssertSqlSafe};
 
-pub struct SqliteMetadataStore {
-    pool: SqlitePool,
+pub struct SqlMetadataStore {
+    pool: AnyPool,
+    postgres: bool,
 }
 
-impl SqliteMetadataStore {
+impl SqlMetadataStore {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
-        let max_connections = if database_url.starts_with("sqlite::memory:") {
+        sqlx::any::install_default_drivers();
+        let max_connections = if database_url == "sqlite::memory:" {
             1
         } else {
             5
         };
-        let options = database_url
-            .parse::<SqliteConnectOptions>()?
-            .create_if_missing(true);
-        let pool = SqlitePoolOptions::new()
+        let postgres =
+            database_url.starts_with("postgres://") || database_url.starts_with("postgresql://");
+        let pool = AnyPoolOptions::new()
             .max_connections(max_connections)
-            .connect_with(options)
+            .connect(database_url)
             .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS access_keys (
@@ -41,31 +42,43 @@ impl SqliteMetadataStore {
         )
         .execute(&pool)
         .await?;
-        Ok(Self { pool })
+        Ok(Self { pool, postgres })
+    }
+
+    fn placeholder(&self, index: usize) -> String {
+        if self.postgres {
+            format!("${index}")
+        } else {
+            "?".to_string()
+        }
     }
 }
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key) VALUES (?, ?)
-             ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key",
-        )
-        .bind(access_key)
-        .bind(secret_key)
-        .execute(&self.pool)
-        .await?;
+        let first = self.placeholder(1);
+        let second = self.placeholder(2);
+        let query = format!(
+            "INSERT INTO access_keys (access_key, secret_key) VALUES ({first}, {second})
+             ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key"
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(access_key)
+            .bind(secret_key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn secret_key(&self, access_key: &str) -> anyhow::Result<Option<String>> {
-        Ok(
-            sqlx::query_scalar("SELECT secret_key FROM access_keys WHERE access_key = ?")
-                .bind(access_key)
-                .fetch_optional(&self.pool)
-                .await?,
-        )
+        Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT secret_key FROM access_keys WHERE access_key = {}",
+            self.placeholder(1)
+        )))
+        .bind(access_key)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     async fn set_object_metadata(
@@ -81,22 +94,28 @@ impl MetadataStore for SqliteMetadataStore {
         }
 
         let mut transaction = self.pool.begin().await?;
-        let mut query_builder = QueryBuilder::<Sqlite>::new(
+        let query = format!(
             "INSERT INTO object_metadata
-                (namespace, bucket, object, metadata_key, metadata_value) ",
+                (namespace, bucket, object, metadata_key, metadata_value)
+             VALUES ({}, {}, {}, {}, {})
+             ON CONFLICT(namespace, bucket, object, metadata_key)
+             DO UPDATE SET metadata_value = excluded.metadata_value",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+            self.placeholder(4),
+            self.placeholder(5),
         );
-        query_builder.push_values(metadata, |mut row, (key, value)| {
-            row.push_bind(namespace)
-                .push_bind(bucket)
-                .push_bind(object)
-                .push_bind(key)
-                .push_bind(value);
-        });
-        query_builder.push(
-            " ON CONFLICT(namespace, bucket, object, metadata_key)
-              DO UPDATE SET metadata_value = excluded.metadata_value",
-        );
-        query_builder.build().execute(&mut *transaction).await?;
+        for (key, value) in metadata {
+            sqlx::query(AssertSqlSafe(query.clone()))
+                .bind(namespace)
+                .bind(bucket)
+                .bind(object)
+                .bind(key)
+                .bind(value)
+                .execute(&mut *transaction)
+                .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -107,15 +126,19 @@ impl MetadataStore for SqliteMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<ObjectMetadata> {
-        let rows = sqlx::query_as::<_, (String, String)>(
+        let query = format!(
             "SELECT metadata_key, metadata_value FROM object_metadata
-             WHERE namespace = ? AND bucket = ? AND object = ?",
-        )
-        .bind(namespace)
-        .bind(bucket)
-        .bind(object)
-        .fetch_all(&self.pool)
-        .await?;
+             WHERE namespace = {} AND bucket = {} AND object = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        let rows = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .bind(object)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(ObjectMetadata::from_map(rows.into_iter().collect()))
     }
 
@@ -125,28 +148,36 @@ impl MetadataStore for SqliteMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<()> {
-        sqlx::query(
+        let query = format!(
             "DELETE FROM object_metadata
-             WHERE namespace = ? AND bucket = ? AND object = ?",
-        )
-        .bind(namespace)
-        .bind(bucket)
-        .bind(object)
-        .execute(&self.pool)
-        .await?;
+             WHERE namespace = {} AND bucket = {} AND object = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .bind(object)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let like_pattern = pattern.replace('*', "%");
-        Ok(sqlx::query_scalar(
-            "SELECT 'secret_key::' || access_key FROM access_keys WHERE access_key LIKE ?",
-        )
+        Ok(sqlx::query_scalar(AssertSqlSafe(format!(
+            "SELECT 'secret_key::' || access_key FROM access_keys WHERE access_key LIKE {}",
+            self.placeholder(1)
+        )))
         .bind(like_pattern)
         .fetch_all(&self.pool)
         .await?)
     }
 }
+
+pub type SqliteMetadataStore = SqlMetadataStore;
+pub type PostgresMetadataStore = SqlMetadataStore;
 
 #[cfg(test)]
 mod tests {
@@ -154,7 +185,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[tokio::test]
-    async fn sqlite_metadata_store_round_trips_secrets_and_object_metadata() {
+    async fn sql_metadata_store_round_trips_secrets_and_object_metadata() {
         let store = SqliteMetadataStore::connect("sqlite::memory:")
             .await
             .unwrap();
