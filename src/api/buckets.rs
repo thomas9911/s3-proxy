@@ -22,7 +22,7 @@ pub async fn list_buckets(
     while let Some(entry) = lister.next().await {
         match entry {
             Ok(entry) => {
-                if entry.metadata().is_dir() {
+                if entry.metadata().is_dir() && entry.path().trim_end_matches('/') != namespace {
                     buckets.push(templates::ListBucketItem {
                         name: entry.name().trim_end_matches('/').to_string().into(),
                         timestamp: None,
@@ -42,7 +42,7 @@ pub async fn list_buckets(
         buckets,
     };
 
-    Ok(askama_axum::into_response(&template))
+    Ok(template.into_response())
 }
 
 pub async fn create_bucket(
@@ -77,7 +77,7 @@ pub async fn delete_bucket(
 ) -> Result<Response, RouteError> {
     let namespace = signature.namespace;
     let bucket_path = format!("{}/{}/", namespace, bucket_name);
-    if !opendal_operator.is_exist(&bucket_path).await? {
+    if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",

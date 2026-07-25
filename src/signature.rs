@@ -1,5 +1,3 @@
-use askama_axum::IntoResponse;
-use async_trait::async_trait;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
@@ -10,6 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, FromRequestParts, OriginalUri, Request};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, HeaderValue, Method, Response, StatusCode};
+use axum::response::IntoResponse;
 use std::convert::Infallible;
 use std::time::SystemTime;
 use time::error::Parse;
@@ -91,7 +90,6 @@ impl From<anyhow::Error> for VerifiedRequestError {
     }
 }
 
-#[async_trait]
 impl FromRequest<AppState> for VerifiedRequest {
     type Rejection = VerifiedRequestError;
 

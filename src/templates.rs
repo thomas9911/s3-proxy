@@ -1,4 +1,5 @@
 use askama::Template;
+use askama_web::WebTemplate;
 use serde::Deserialize;
 use std::borrow::Cow;
 
@@ -8,7 +9,7 @@ pub struct ListBucketItem<'a> {
     pub timestamp: Option<Cow<'a, str>>,
 }
 
-#[derive(Debug, Template)]
+#[derive(Debug, Template, WebTemplate)]
 #[template(path = "list_buckets.xml")]
 pub struct ListBucketsTemplate<'a> {
     pub owner_name: &'a str,
@@ -24,7 +25,7 @@ pub struct ListObjectItem<'a> {
     pub size: u64,
 }
 
-#[derive(Debug, Template)]
+#[derive(Debug, Template, WebTemplate)]
 #[template(path = "list_objects.xml")]
 pub struct ListObjectsTemplate<'a> {
     pub is_truncated: bool,

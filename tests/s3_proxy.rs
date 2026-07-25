@@ -1,28 +1,58 @@
-use std::path::Path;
 use std::process::{Child, Command};
+use std::str::FromStr;
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, Owner};
 use aws_sdk_s3::Client;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 /// `setup()` is used to prepare the environment and spawn the child process for the test cases.
-fn setup() -> std::io::Result<Child> {
+async fn setup() -> anyhow::Result<Child> {
+    let access_key = "ANOTREAL";
+    let secret_key = "notrealrnrELgWzOk3IfjzDKtFBhDby";
+    let database_name = format!("s3-proxy-test-{}.db", std::process::id());
+    let database_url = format!("sqlite://target/{database_name}");
+    let options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS access_keys (
+            access_key TEXT PRIMARY KEY,
+            secret_key TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_keys (access_key, secret_key) VALUES (?, ?)
+         ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key",
+    )
+    .bind(access_key)
+    .bind(secret_key)
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
     let path = assert_cmd::cargo::cargo_bin(env!("CARGO_PKG_NAME"));
 
     let process = Command::new(path)
-        .env("S3_PROXY__REDIS__URL", "redis://127.0.0.1:6379")
+        .env("S3_PROXY__METADATA_BACKEND", "sqlite")
+        .env("S3_PROXY__SQLITE__URL", &database_url)
+        .env("S3_PROXY__EXTERNAL_SERVER_HOST", "http://127.0.0.1:3000")
         .env("S3_PROXY__OPENDAL_PROVIDER", "memory")
         .env("S3_PROXY__OPENDAL__ROOT", "/tmp")
         .spawn();
 
-    process
+    Ok(process?)
 }
 
 #[tokio::test]
 async fn test_it_runs() {
-    let mut process = setup().unwrap();
+    let mut process = setup().await.unwrap();
 
     let region_provider = RegionProviderChain::first_try(Region::new("us-west-2"));
 
@@ -42,13 +72,13 @@ async fn test_it_runs() {
     let _ = create_bucket_req2.send().await;
     let list_bucket_res = list_bucket_req.send().await;
 
-    let body = ByteStream::from_path(Path::new("Cargo.toml")).await;
+    let body = ByteStream::from_static(b"s3-proxy integration test");
     let put_object_res = client
         .put_object()
         .bucket("testing2")
         .key("Cargo.toml")
         .content_type("application/toml")
-        .body(body.unwrap())
+        .body(body)
         .send()
         .await;
 
@@ -63,6 +93,7 @@ async fn test_it_runs() {
 
     process.kill().expect("command couldn't be killed");
     process.wait().expect("command couldn't be waited on");
+    let _ = std::fs::remove_file(format!("target/s3-proxy-test-{}.db", std::process::id()));
 
     let out = list_bucket_res.unwrap();
 

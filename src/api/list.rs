@@ -5,9 +5,8 @@ use crate::signature::{s3_error_response, VerifiedRequest};
 use crate::{templates, AppState};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
-use opendal::Metakey;
 use tokio_stream::StreamExt;
 
 pub async fn list_objects(
@@ -21,7 +20,7 @@ pub async fn list_objects(
     let namespace = &signature.namespace;
 
     if !opendal_operator
-        .is_exist(&format!("{}/{}/", namespace, bucket_name))
+        .exists(&format!("{}/{}/", namespace, bucket_name))
         .await?
     {
         return Ok(s3_error_response(
@@ -34,7 +33,6 @@ pub async fn list_objects(
     let mut lister = opendal_operator
         .lister_with(&format!("{}/{}/", namespace, bucket_name))
         .recursive(true)
-        .metakey(Metakey::ContentLength)
         .await?;
 
     let prefix = query
@@ -62,9 +60,8 @@ pub async fn list_objects(
                         .strip_prefix(&format!("{}/{}/", namespace, bucket_name))
                         .unwrap_or(entry.path());
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
-                    let last_modified = metadata
-                        .last_modified()
-                        .map(|dt| Cow::from(dt.to_rfc3339()));
+                    let last_modified =
+                        metadata.last_modified().map(|dt| Cow::from(dt.to_string()));
                     let size = metadata.content_length();
                     if key.starts_with(prefix.as_ref()) {
                         all_objects.push(templates::ListObjectItem {
@@ -108,5 +105,5 @@ pub async fn list_objects(
         max_keys,
     };
 
-    Ok(askama_axum::into_response(&template))
+    Ok(template.into_response())
 }

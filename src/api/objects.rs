@@ -23,7 +23,7 @@ pub async fn create_object(
     let namespace = signature.namespace;
 
     if !opendal_operator
-        .is_exist(&format!("{}/{}/", namespace, bucket_name))
+        .exists(&format!("{}/{}/", namespace, bucket_name))
         .await?
     {
         return Ok(s3_error_response(
@@ -33,10 +33,8 @@ pub async fn create_object(
         ));
     }
 
-    let mut writer = opendal_operator.write_with(
-        &format!("{}/{}/{}", namespace, bucket_name, object_name),
-        signature.bytes,
-    );
+    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let mut writer = opendal_operator.write_with(&filepath, signature.bytes);
 
     writer = if let Some(content_type) = header_map.get(CONTENT_TYPE) {
         if let Ok(content_type) = content_type.to_str() {
@@ -82,7 +80,7 @@ pub async fn get_object(
     let namespace = signature.namespace;
 
     if !opendal_operator
-        .is_exist(&format!("{}/{}/", namespace, bucket_name))
+        .exists(&format!("{}/{}/", namespace, bucket_name))
         .await?
     {
         return Ok(s3_error_response(
@@ -124,7 +122,8 @@ pub async fn get_object(
         HeaderValue::from_str(&metadata.content_length().to_string())?,
     );
 
-    Ok((response_headers, Body::from_stream(reader)).into_response())
+    let stream = reader.into_bytes_stream(..).await?;
+    Ok((response_headers, Body::from_stream(stream)).into_response())
 }
 
 pub async fn head_object(
@@ -138,7 +137,7 @@ pub async fn head_object(
 ) -> Result<Response, RouteError> {
     let namespace = signature.namespace;
     let bucket_path = format!("{}/{}/", namespace, bucket_name);
-    if !opendal_operator.is_exist(&bucket_path).await? {
+    if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -185,7 +184,7 @@ pub async fn delete_object(
 ) -> Result<Response, RouteError> {
     let namespace = signature.namespace;
     if !opendal_operator
-        .is_exist(&format!("{}/{}/", namespace, bucket_name))
+        .exists(&format!("{}/{}/", namespace, bucket_name))
         .await?
     {
         return Ok(s3_error_response(
@@ -195,7 +194,7 @@ pub async fn delete_object(
         ));
     }
     let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
-    if opendal_operator.is_exist(&filepath).await? {
+    if opendal_operator.exists(&filepath).await? {
         opendal_operator.delete(&filepath).await?;
     }
     Ok(StatusCode::NO_CONTENT.into_response())

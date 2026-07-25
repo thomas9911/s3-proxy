@@ -5,12 +5,12 @@
     "": {
       "name": "s3-proxy-regression-tests",
       "dependencies": {
-        "@aws-sdk/client-s3": "^3.932.0",
-        "@aws-sdk/s3-presigned-post": "^3.932.0",
+        "@aws-sdk/client-s3": "latest",
+        "@aws-sdk/s3-presigned-post": "latest",
       },
       "devDependencies": {
         "@types/bun": "latest",
-        "typescript": "^7.0.2",
+        "typescript": "latest",
       },
     },
   },

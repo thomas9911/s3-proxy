@@ -62,7 +62,7 @@ pub async fn post_object(
         ));
     };
     if !opendal_operator
-        .is_exist(&format!("{access_key}/{bucket_name}/"))
+        .exists(&format!("{access_key}/{bucket_name}/"))
         .await?
     {
         return Ok(s3_error_response(
@@ -160,8 +160,8 @@ pub async fn post_object(
             "Missing file",
         ));
     };
-    let mut writer =
-        opendal_operator.write_with(&format!("{access_key}/{bucket_name}/{key}"), file);
+    let filepath = format!("{access_key}/{bucket_name}/{key}");
+    let mut writer = opendal_operator.write_with(&filepath, file);
     if let Some(content_type) = fields.get("content-type") {
         writer = writer.content_type(content_type);
     }

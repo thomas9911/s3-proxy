@@ -4,10 +4,8 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
 use axum_route_error::RouteError;
-use opendal::{Operator, Scheme};
-use serde::{Deserialize, Deserializer};
+use opendal::Operator;
 use std::collections::HashMap;
-use std::str::FromStr;
 use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
@@ -29,32 +27,13 @@ pub struct Config {
     pub metadata_backend: String,
     pub redis: Option<deadpool_redis::Config>,
     pub sqlite: Option<SqliteConfig>,
-    #[serde(deserialize_with = "scheme_opendal")]
-    pub opendal_provider: opendal::Scheme,
+    pub opendal_provider: String,
     pub opendal: HashMap<String, String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SqliteConfig {
     pub url: String,
-}
-
-fn scheme_opendal<'de, D>(deserializer: D) -> Result<opendal::Scheme, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    String::deserialize(deserializer).and_then(|string| {
-        let scheme =
-            opendal::Scheme::from_str(&string).map_err(|err| Error::custom(err.to_string()))?;
-
-        if !opendal::Scheme::enabled().contains(&scheme) {
-            return Err(Error::custom(format!("{} support is not enabled", scheme)));
-        }
-
-        Ok(scheme)
-    })
 }
 
 fn default_host() -> String {
@@ -106,7 +85,7 @@ impl AppState {
                 }
                 backend => anyhow::bail!("Unsupported metadata backend: {backend}"),
             };
-        let operator = Operator::via_map(config.opendal_provider, config.opendal.clone())?;
+        let operator = Operator::via_iter(&config.opendal_provider, config.opendal.clone())?;
 
         Ok(AppState {
             metadata_store,
@@ -118,33 +97,11 @@ impl AppState {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args();
-
-    if args.find(|arg| arg == "--backends").is_some() {
-        let mut schemes: Vec<_> = opendal::Scheme::enabled().into_iter().collect();
-        schemes.sort_by_key(|scheme| scheme.into_static());
-
-        for scheme in schemes {
-            if scheme == Scheme::Ghac {
-                continue;
-            }
-            let map = HashMap::from([
-                ("root".to_string(), "/tmp".to_string()),
-                ("container".to_string(), "tmp".to_string()),
-                ("filesystem".to_string(), "tmp".to_string()),
-                ("bucket".to_string(), "tmp".to_string()),
-                ("region".to_string(), "eu-west1".to_string()),
-                ("endpoint".to_string(), "127.0.0.1".to_string()),
-                ("account_name".to_string(), "abc".to_string()),
-                ("access_key_id".to_string(), "abc".to_string()),
-                ("secret_access_key".to_string(), "abc".to_string()),
-            ]);
-
-            let cap =
-                Operator::via_map(scheme, map).map(|operator| operator.info().full_capability())?;
-            if cap.list && cap.write && cap.read && cap.create_dir {
-                println!("{} => {:?}", scheme, cap)
-            }
+    if std::env::args().any(|arg| arg == "--backends") {
+        let operator = Operator::via_iter("memory", HashMap::new())?;
+        let capability = operator.info().full_capability();
+        if capability.list && capability.write && capability.read && capability.create_dir {
+            println!("memory => {:?}", capability);
         }
         return Ok(());
     }
@@ -161,14 +118,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/_metadata", get(metadata_debug))
         .route("/", get(api::list_buckets))
         .directory_route(
-            "/:bucket_name",
+            "/{bucket_name}",
             get(api::list_objects)
                 .put(api::create_bucket)
                 .delete(api::delete_bucket)
                 .post(api::post_object),
         )
         .route(
-            "/:bucket_name/*object_name",
+            "/{bucket_name}/{*object_name}",
             get(api::get_object)
                 .head(api::head_object)
                 .put(api::create_object)
