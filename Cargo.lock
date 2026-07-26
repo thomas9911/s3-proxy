@@ -2957,6 +2957,7 @@ dependencies = [
  "opendal-layer-logging",
  "opendal-layer-retry",
  "opendal-layer-timeout",
+ "opendal-layer-tracing",
  "opendal-service-azblob",
  "opendal-service-b2",
  "opendal-service-cloudflare-kv",
@@ -3052,6 +3053,18 @@ checksum = "1e91f731724c213af81e9d03517859c8fc47b4578e64ad61ae4f099f10fe36e3"
 dependencies = [
  "opendal-core",
  "tokio",
+]
+
+[[package]]
+name = "opendal-layer-tracing"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90c6fc9df6da1f0dafbdf55fa48525f1643aefbe7da8f46936e869e2a5b8a34f"
+dependencies = [
+ "futures",
+ "http 1.4.2",
+ "opendal-core",
+ "tracing",
 ]
 
 [[package]]
@@ -4398,6 +4411,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "urlencoding",
 ]
 
 [[package]]

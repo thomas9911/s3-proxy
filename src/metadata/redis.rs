@@ -35,6 +35,7 @@ impl MetadataStore for RedisMetadataStore {
         object: &str,
         metadata: &ObjectMetadata,
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("redis.set_object_metadata");
         let metadata = metadata.clone().into_map();
         if metadata.is_empty() {
             return Ok(());
@@ -53,6 +54,7 @@ impl MetadataStore for RedisMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<ObjectMetadata> {
+        let _timer = super::operation_timer("redis.object_metadata");
         let mut connection = self.pool.get().await?;
         Ok(ObjectMetadata::from_map(
             connection
@@ -67,6 +69,7 @@ impl MetadataStore for RedisMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("redis.delete_object_metadata");
         let mut connection = self.pool.get().await?;
         let _: () = connection
             .del(object_metadata_key(namespace, bucket, object))
@@ -80,6 +83,7 @@ impl MetadataStore for RedisMetadataStore {
         bucket: &str,
         objects: &[&str],
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("redis.delete_many_object_metadata");
         if objects.is_empty() {
             return Ok(());
         }
@@ -158,6 +162,52 @@ impl MetadataStore for RedisMetadataStore {
         }
         Ok(())
     }
+
+    async fn set_bucket_policy(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        policy: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let _: () = connection
+            .set(bucket_policy_key(namespace, bucket), policy)
+            .await?;
+        Ok(())
+    }
+
+    async fn bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<Option<String>> {
+        let _timer = super::operation_timer("redis.bucket_policy");
+        let mut connection = self.pool.get().await?;
+        Ok(connection.get(bucket_policy_key(namespace, bucket)).await?)
+    }
+
+    async fn bucket_policies(&self, bucket: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let _timer = super::operation_timer("redis.bucket_policies");
+        let mut connection = self.pool.get().await?;
+        let keys: Vec<String> = connection
+            .keys(format!("bucket_policy::*/{bucket}"))
+            .await?;
+        let mut policies = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(policy) = connection.get::<_, Option<String>>(&key).await? else {
+                continue;
+            };
+            if let Some(namespace) = key
+                .strip_prefix("bucket_policy::")
+                .and_then(|value| value.strip_suffix(&format!("/{bucket}")))
+            {
+                policies.push((namespace.to_string(), policy));
+            }
+        }
+        Ok(policies)
+    }
+
+    async fn delete_bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let _: () = connection.del(bucket_policy_key(namespace, bucket)).await?;
+        Ok(())
+    }
 }
 
 fn object_metadata_key(namespace: &str, bucket: &str, object: &str) -> String {
@@ -170,4 +220,8 @@ fn public_bucket_key(bucket: &str) -> String {
 
 fn public_object_key(bucket: &str, object: &str) -> String {
     format!("public_object::{bucket}/{object}")
+}
+
+fn bucket_policy_key(namespace: &str, bucket: &str) -> String {
+    format!("bucket_policy::{namespace}/{bucket}")
 }

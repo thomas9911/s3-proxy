@@ -2,6 +2,7 @@ use crate::signature::s3_error_response;
 use crate::signature::VerifiedRequest;
 use crate::{metadata::ObjectMetadata, templates, AppState};
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
+use axum::body::Body;
 use axum::extract::{FromRequest, Multipart, Path, Request, State};
 use axum::http::header::HeaderName;
 use axum::http::{HeaderValue, StatusCode};
@@ -10,7 +11,9 @@ use axum_route_error::RouteError;
 use base64::Engine;
 use futures_util::stream::StreamExt as FuturesStreamExt;
 use md5::{Digest, Md5};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CONTENT_MD5: HeaderName = HeaderName::from_static("content-md5");
 
@@ -25,6 +28,7 @@ pub async fn post_bucket(
         .unwrap_or_default()
         .split('&')
         .any(|parameter| parameter == "delete" || parameter.starts_with("delete="));
+    let is_uploads = query_value(request.uri().query(), "uploads").is_some();
     if is_delete {
         let content_md5 = request.headers().get(CONTENT_MD5).cloned();
         let verified = match VerifiedRequest::from_request(request, &state).await {
@@ -33,9 +37,317 @@ pub async fn post_bucket(
         };
         return delete_objects(bucket_name, state, verified, content_md5).await;
     }
+    if is_uploads {
+        let verified = match VerifiedRequest::from_request(request, &state).await {
+            Ok(verified) => verified,
+            Err(error) => return Ok(error.into_response()),
+        };
+        return initiate_multipart(bucket_name, None, State(state), verified).await;
+    }
 
     let multipart = Multipart::from_request(request, &state).await?;
     post_object(Path(bucket_name), State(state), multipart).await
+}
+
+pub async fn post_object_route(
+    Path((bucket_name, object_name)): Path<(String, String)>,
+    State(state): State<AppState>,
+    request: Request,
+) -> Response {
+    if query_value(request.uri().query(), "uploads").is_some() {
+        let verified = match VerifiedRequest::from_request(request, &state).await {
+            Ok(verified) => verified,
+            Err(error) => return error.into_response(),
+        };
+        return initiate_multipart(bucket_name, Some(object_name), State(state), verified)
+            .await
+            .map_or_else(IntoResponse::into_response, |response| response);
+    }
+    let Some(upload_id) = query_value(request.uri().query(), "uploadId") else {
+        return s3_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The requested method is not supported for this resource.",
+        );
+    };
+    let verified = match VerifiedRequest::from_request(request, &state).await {
+        Ok(verified) => verified,
+        Err(error) => return error.into_response(),
+    };
+    complete_multipart(bucket_name, object_name, state, verified, upload_id)
+        .await
+        .map_or_else(IntoResponse::into_response, |response| response)
+}
+
+pub async fn initiate_multipart(
+    bucket_name: String,
+    object_name: Option<String>,
+    State(AppState {
+        opendal_operator, ..
+    }): State<AppState>,
+    signature: VerifiedRequest,
+) -> Result<Response, RouteError> {
+    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
+    if !opendal_operator.exists(&bucket_path).await? {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    }
+    let upload_id = format!(
+        "{:x}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos()
+    );
+    opendal_operator
+        .create_dir(&format!(
+            "{}/{}/",
+            signature.namespace,
+            multipart_prefix(&upload_id)
+        ))
+        .await?;
+    let object_name = object_name.unwrap_or_default();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(format!(
+            "<InitiateMultipartUploadResult><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+        )))
+        .expect("static multipart response headers are valid"))
+}
+
+pub async fn upload_part(
+    bucket_name: String,
+    _object_name: String,
+    state: AppState,
+    signature: VerifiedRequest,
+    upload_id: String,
+    part_number: u32,
+) -> Result<Response, RouteError> {
+    if !(1..=10_000).contains(&part_number) || !valid_upload_id(&upload_id) {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidPart",
+            "The part number or upload ID is invalid.",
+        ));
+    }
+    let AppState {
+        opendal_operator, ..
+    } = state;
+    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
+    if !opendal_operator.exists(&bucket_path).await? {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    }
+    let part_path = multipart_part_path(&signature.namespace, &upload_id, part_number);
+    opendal_operator.write(&part_path, signature.bytes).await?;
+    Ok(StatusCode::OK.into_response())
+}
+
+pub async fn complete_multipart(
+    bucket_name: String,
+    object_name: String,
+    state: AppState,
+    signature: VerifiedRequest,
+    upload_id: String,
+) -> Result<Response, RouteError> {
+    if !valid_upload_id(&upload_id) {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
+    let request: CompleteMultipartUpload = quick_xml::de::from_str(
+        std::str::from_utf8(&signature.bytes).map_err(|_| RouteError::new_internal_server())?,
+    )?;
+    let AppState {
+        opendal_operator,
+        metadata_store,
+        ..
+    } = state;
+    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
+    if !opendal_operator.exists(&bucket_path).await? {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    }
+    let mut parts = request.parts;
+    parts.sort_by_key(|part| part.part_number);
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| !(1..=10_000).contains(&part.part_number))
+    {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidPart",
+            "The multipart completion request is invalid.",
+        ));
+    }
+    let mut content = Vec::new();
+    for part in &parts {
+        let path = multipart_part_path(&signature.namespace, &upload_id, part.part_number);
+        let bytes = match opendal_operator.read(&path).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPart",
+                    "One or more parts are missing.",
+                ))
+            }
+        };
+        content.extend_from_slice(&bytes.to_vec());
+    }
+    let object_path = format!("{}/{}/{}", signature.namespace, bucket_name, object_name);
+    opendal_operator
+        .write(&object_path, content.clone())
+        .await?;
+    let metadata = ObjectMetadata {
+        content_length: Some(content.len() as u64),
+        ..Default::default()
+    };
+    crate::retry::retry("set_multipart_object_metadata", || {
+        metadata_store.set_object_metadata(
+            &signature.namespace,
+            &bucket_name,
+            &object_name,
+            &metadata,
+        )
+    })
+    .await?;
+    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    opendal_operator
+        .delete_with(&prefix)
+        .recursive(true)
+        .await?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(format!(
+            "<CompleteMultipartUploadResult><Location>/{bucket_name}/{object_name}</Location><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><ETag></ETag></CompleteMultipartUploadResult>"
+        )))
+        .expect("static multipart response headers are valid"))
+}
+
+pub async fn abort_multipart(
+    bucket_name: String,
+    state: AppState,
+    signature: VerifiedRequest,
+    upload_id: String,
+) -> Result<Response, RouteError> {
+    if !valid_upload_id(&upload_id) {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
+    let AppState {
+        opendal_operator, ..
+    } = state;
+    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
+    if !opendal_operator.exists(&bucket_path).await? {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    }
+    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    opendal_operator
+        .delete_with(&prefix)
+        .recursive(true)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+pub async fn list_parts(
+    bucket_name: String,
+    object_name: String,
+    state: AppState,
+    signature: VerifiedRequest,
+    upload_id: String,
+) -> Result<Response, RouteError> {
+    if !valid_upload_id(&upload_id) {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
+    let AppState {
+        opendal_operator, ..
+    } = state;
+    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    let mut lister = opendal_operator.lister_with(&prefix).await?;
+    let mut parts = Vec::new();
+    while let Some(entry) = lister.next().await {
+        let entry = entry?;
+        if entry.metadata().is_file() {
+            if let Ok(part_number) = entry.name().parse::<u32>() {
+                parts.push((part_number, entry.metadata().content_length()));
+            }
+        }
+    }
+    parts.sort_by_key(|(part_number, _)| *part_number);
+    let entries = parts
+        .into_iter()
+        .map(|(part_number, size)| {
+            format!(
+                "<Part><PartNumber>{part_number}</PartNumber><LastModified>1970-01-01T00:00:00Z</LastModified><ETag></ETag><Size>{size}</Size></Part>"
+            )
+        })
+        .collect::<String>();
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(format!(
+            "<ListPartsResult><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><UploadId>{upload_id}</UploadId>{entries}</ListPartsResult>"
+        )))
+        .expect("static multipart response headers are valid"))
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteMultipartUpload {
+    #[serde(rename = "Part", default)]
+    parts: Vec<CompletedPart>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletedPart {
+    #[serde(rename = "PartNumber")]
+    part_number: u32,
+    #[serde(rename = "ETag", default)]
+    _etag: String,
+}
+
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == key).then(|| value.to_string())
+    })
+}
+
+fn valid_upload_id(upload_id: &str) -> bool {
+    !upload_id.is_empty() && upload_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn multipart_prefix(upload_id: &str) -> String {
+    format!(".multipart/{upload_id}")
+}
+
+fn multipart_part_path(namespace: &str, upload_id: &str, part_number: u32) -> String {
+    format!("{namespace}/{}/{part_number}", multipart_prefix(upload_id))
 }
 
 pub async fn post_object(
@@ -306,7 +618,10 @@ async fn delete_objects(
     let mut errors = Vec::new();
     for result in results {
         match result {
-            Ok(keys) => deleted.extend(keys),
+            Ok((keys, batch_errors)) => {
+                deleted.extend(keys);
+                errors.extend(batch_errors);
+            }
             Err(error) => errors.push(error),
         }
     }
@@ -323,32 +638,50 @@ async fn delete_batch(
     namespace: &str,
     bucket_name: &str,
     objects: Vec<templates::DeleteObjectIdentifier>,
-) -> Result<Vec<String>, templates::DeleteObjectError> {
-    let mut deleter = opendal_operator
-        .deleter()
-        .await
-        .map_err(|error| delete_error(String::new(), error))?;
-    for object in &objects {
-        let filepath = format!("{namespace}/{bucket_name}/{}", object.key);
-        deleter
-            .delete(filepath)
-            .await
-            .map_err(|error| delete_error(object.key.clone(), error))?;
+) -> Result<(Vec<String>, Vec<templates::DeleteObjectError>), templates::DeleteObjectError> {
+    let results = tokio_stream::iter(objects.into_iter().map(|object| {
+        let opendal_operator = opendal_operator.clone();
+        let namespace = namespace.to_string();
+        let bucket_name = bucket_name.to_string();
+        async move {
+            let filepath = format!("{namespace}/{bucket_name}/{}", object.key);
+            let mut deleter = opendal_operator
+                .deleter()
+                .await
+                .map_err(|error| delete_error(object.key.clone(), error))?;
+            deleter
+                .delete(filepath)
+                .await
+                .map_err(|error| delete_error(object.key.clone(), error))?;
+            deleter
+                .close()
+                .await
+                .map_err(|error| delete_error(object.key.clone(), error))?;
+            Ok::<_, templates::DeleteObjectError>(object.key)
+        }
+    }))
+    .buffered(20)
+    .collect::<Vec<_>>()
+    .await;
+    let mut object_names = Vec::new();
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(object) => {
+                deleted.push(object.clone());
+                object_names.push(object);
+            }
+            Err(error) => errors.push(error),
+        }
     }
-    deleter
-        .close()
-        .await
-        .map_err(|error| delete_error(String::new(), error))?;
-
-    let object_names = objects
-        .iter()
-        .map(|object| object.key.as_str())
-        .collect::<Vec<_>>();
-    metadata_store
-        .delete_many_object_metadata(namespace, bucket_name, &object_names)
-        .await
-        .map_err(|error| delete_error(String::new(), error))?;
-    Ok(objects.into_iter().map(|object| object.key).collect())
+    let object_names = object_names.iter().map(String::as_str).collect::<Vec<_>>();
+    crate::retry::retry("delete_many_object_metadata", || {
+        metadata_store.delete_many_object_metadata(namespace, bucket_name, &object_names)
+    })
+    .await
+    .map_err(|error| delete_error(String::new(), error))?;
+    Ok((deleted, errors))
 }
 
 fn delete_error(key: String, error: impl std::fmt::Display) -> templates::DeleteObjectError {

@@ -1,5 +1,6 @@
 use crate::axum_ext::RouterExt;
-use axum::extract::State;
+use crate::signature::s3_error_response;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::Router;
@@ -15,6 +16,8 @@ mod api;
 mod axum_ext;
 mod backends;
 mod metadata;
+mod policy;
+mod retry;
 mod signature;
 mod templates;
 
@@ -98,7 +101,8 @@ impl AppState {
                 }
                 backend => anyhow::bail!("Unsupported metadata backend: {backend}"),
             };
-        let operator = Operator::via_iter(&config.opendal_provider, config.opendal.clone())?;
+        let operator = Operator::via_iter(&config.opendal_provider, config.opendal.clone())?
+            .layer(opendal::layers::TracingLayer::new());
 
         Ok(AppState {
             metadata_store,
@@ -133,19 +137,28 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(api::list_buckets))
         .directory_route(
             "/{bucket_name}",
-            get(api::list_objects)
-                .put(api::create_bucket)
-                .delete(api::delete_bucket)
+            get(api::get_bucket)
+                .put(api::put_bucket)
+                .delete(api::delete_bucket_route)
                 .post(api::post_bucket),
         )
         .route(
             "/{bucket_name}/{*object_name}",
             get(api::get_object)
                 .head(api::head_object)
-                .put(api::create_object)
-                .delete(api::delete_object),
+                .put(api::put_object)
+                .delete(api::delete_object_route)
+                .post(api::post_object_route),
         )
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(ServiceBuilder::new().layer(TraceLayer::new_for_http()))
+        .fallback(|| async {
+            s3_error_response(
+                axum::http::StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The requested resource was not found.",
+            )
+        })
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(server_host).await?;

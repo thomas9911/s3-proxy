@@ -3,6 +3,7 @@ const baseEnv = {
 	S3_TEST_ACCESS_KEY: process.env.S3_TEST_ACCESS_KEY ?? "minioadmin",
 	S3_TEST_SECRET_KEY: process.env.S3_TEST_SECRET_KEY ?? "minioadmin",
 	S3_TEST_REGION: process.env.S3_TEST_REGION ?? "us-east-1",
+	S3_TEST_PROFILE: process.env.S3_TEST_PROFILE ?? "1",
 };
 
 function run(label: string, variables: Record<string, string>) {
@@ -17,7 +18,8 @@ function run(label: string, variables: Record<string, string>) {
 	}
 }
 
-const externalEndpoint = null;
+const externalEndpoint =
+	process.env.S3_TEST_EXTERNAL_ENDPOINT ?? process.env.S3_TEST_ENDPOINT;
 
 if (externalEndpoint) {
 	run("external", {

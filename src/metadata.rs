@@ -1,11 +1,34 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::time::Instant;
 
 mod redis;
 mod sql;
 
 pub use redis::RedisMetadataStore;
 pub use sql::{PostgresMetadataStore, SqliteMetadataStore};
+
+pub(crate) struct OperationTimer {
+    operation: &'static str,
+    started: Instant,
+}
+
+impl Drop for OperationTimer {
+    fn drop(&mut self) {
+        tracing::debug!(
+            operation = self.operation,
+            elapsed_us = self.started.elapsed().as_micros() as u64,
+            "metadata operation completed"
+        );
+    }
+}
+
+pub(crate) fn operation_timer(operation: &'static str) -> OperationTimer {
+    OperationTimer {
+        operation,
+        started: Instant::now(),
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObjectMetadata {
@@ -109,4 +132,17 @@ pub trait MetadataStore: Send + Sync {
     ) -> anyhow::Result<Option<String>>;
 
     async fn delete_public_bucket(&self, namespace: &str, bucket: &str) -> anyhow::Result<()>;
+
+    async fn set_bucket_policy(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        policy: &str,
+    ) -> anyhow::Result<()>;
+
+    async fn bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<Option<String>>;
+
+    async fn bucket_policies(&self, bucket: &str) -> anyhow::Result<Vec<(String, String)>>;
+
+    async fn delete_bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<()>;
 }

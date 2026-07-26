@@ -50,6 +50,38 @@ impl SqlMetadataStore {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bucket_policies (
+                namespace TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                PRIMARY KEY (namespace, bucket)
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS metadata_schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        for index in [
+            "CREATE INDEX IF NOT EXISTS idx_object_metadata_lookup ON object_metadata (namespace, bucket, object)",
+            "CREATE INDEX IF NOT EXISTS idx_public_resources_lookup ON public_resources (resource_type, bucket, object)",
+            "CREATE INDEX IF NOT EXISTS idx_bucket_policies_bucket ON bucket_policies (bucket)",
+        ] {
+            sqlx::query(index).execute(&pool).await?;
+        }
+        sqlx::query(
+            "INSERT INTO metadata_schema_migrations (version, applied_at)
+             VALUES (1, CURRENT_TIMESTAMP)
+             ON CONFLICT(version) DO NOTHING",
+        )
+        .execute(&pool)
+        .await?;
         Ok(Self { pool, postgres })
     }
 
@@ -164,6 +196,7 @@ impl MetadataStore for SqliteMetadataStore {
         object: &str,
         metadata: &ObjectMetadata,
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("sql.set_object_metadata");
         let metadata = metadata.clone().into_map();
         if metadata.is_empty() {
             return Ok(());
@@ -212,6 +245,7 @@ impl MetadataStore for SqliteMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<ObjectMetadata> {
+        let _timer = super::operation_timer("sql.object_metadata");
         let query = format!(
             "SELECT metadata_key, metadata_value FROM object_metadata
              WHERE namespace = {} AND bucket = {} AND object = {}",
@@ -234,6 +268,7 @@ impl MetadataStore for SqliteMetadataStore {
         bucket: &str,
         object: &str,
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("sql.delete_object_metadata");
         let query = format!(
             "DELETE FROM object_metadata
              WHERE namespace = {} AND bucket = {} AND object = {}",
@@ -256,6 +291,7 @@ impl MetadataStore for SqliteMetadataStore {
         bucket: &str,
         objects: &[&str],
     ) -> anyhow::Result<()> {
+        let _timer = super::operation_timer("sql.delete_many_object_metadata");
         if objects.is_empty() {
             return Ok(());
         }
@@ -327,6 +363,69 @@ impl MetadataStore for SqliteMetadataStore {
     async fn delete_public_bucket(&self, namespace: &str, bucket: &str) -> anyhow::Result<()> {
         let query = format!(
             "DELETE FROM public_resources WHERE namespace = {} AND bucket = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_bucket_policy(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        policy: &str,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO bucket_policies (namespace, bucket, policy)
+             VALUES ({}, {}, {})
+             ON CONFLICT(namespace, bucket) DO UPDATE SET policy = excluded.policy",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .bind(policy)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<Option<String>> {
+        let _timer = super::operation_timer("sql.bucket_policy");
+        let query = format!(
+            "SELECT policy FROM bucket_policies WHERE namespace = {} AND bucket = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        Ok(sqlx::query_scalar(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
+    async fn bucket_policies(&self, bucket: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let _timer = super::operation_timer("sql.bucket_policies");
+        let query = format!(
+            "SELECT namespace, policy FROM bucket_policies WHERE bucket = {}",
+            self.placeholder(1),
+        );
+        Ok(sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query))
+            .bind(bucket)
+            .fetch_all(&self.pool)
+            .await?)
+    }
+
+    async fn delete_bucket_policy(&self, namespace: &str, bucket: &str) -> anyhow::Result<()> {
+        let query = format!(
+            "DELETE FROM bucket_policies WHERE namespace = {} AND bucket = {}",
             self.placeholder(1),
             self.placeholder(2),
         );

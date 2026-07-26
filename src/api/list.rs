@@ -3,18 +3,143 @@ use std::collections::{HashMap, HashSet};
 
 use crate::signature::{s3_error_response, VerifiedRequest};
 use crate::{templates, AppState};
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::body::Bytes;
+use axum::extract::{FromRequest, Path, Query, State};
+use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
 use tokio_stream::StreamExt;
 
-pub async fn list_objects(
+pub async fn get_bucket(
     Path(bucket_name): Path<String>,
-    Query(query): Query<HashMap<String, String>>,
-    State(AppState {
+    State(state): State<AppState>,
+    request: Request<Body>,
+) -> Response {
+    let is_policy = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "policy" || part.starts_with("policy="));
+    let authenticated = request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION);
+    let query = match Query::<HashMap<String, String>>::try_from_uri(request.uri()) {
+        Ok(Query(query)) => query,
+        Err(error) => return error.into_response(),
+    };
+    let mut signature = if request
+        .headers()
+        .contains_key(axum::http::header::AUTHORIZATION)
+        || is_policy
+    {
+        match VerifiedRequest::from_request(request, &state).await {
+            Ok(signature) => signature,
+            Err(error) => return error.into_response(),
+        }
+    } else {
+        let resource = format!("arn:aws:s3:::{bucket_name}");
+        let mut namespace = if crate::policy::allows_public_read_acl("s3:ListBucket") {
+            state
+                .metadata_store
+                .public_bucket_namespace(&bucket_name)
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        if namespace.is_none() {
+            namespace = match state.metadata_store.bucket_policies(&bucket_name).await {
+                Ok(policies) => policies.into_iter().find_map(|(namespace, policy)| {
+                    crate::policy::allows_anonymous(&policy, "s3:ListBucket", &resource)
+                        .ok()
+                        .filter(|allowed| *allowed)
+                        .map(|_| namespace)
+                }),
+                Err(error) => {
+                    tracing::error!(%error, "failed to resolve bucket policy");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+        }
+        let Some(namespace) = namespace else {
+            return s3_error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied");
+        };
+        VerifiedRequest {
+            access_key: namespace.clone(),
+            namespace,
+            bytes: Bytes::new(),
+        }
+    };
+
+    if authenticated {
+        let resource = format!("arn:aws:s3:::{bucket_name}");
+        let policies = match state.metadata_store.bucket_policies(&bucket_name).await {
+            Ok(policies) => policies,
+            Err(error) => {
+                tracing::error!(%error, "failed to resolve bucket policy");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        for (namespace, policy) in policies {
+            let principal = signature.access_key.as_str();
+            match crate::policy::decision(&policy, Some(principal), "s3:ListBucket", &resource) {
+                Ok(crate::policy::Decision::Deny) => {
+                    return s3_error_response(
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        "Access Denied",
+                    );
+                }
+                Ok(crate::policy::Decision::Allow) => {
+                    signature.namespace = namespace;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "invalid bucket policy");
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            }
+        }
+    }
+
+    if is_policy {
+        return match state
+            .metadata_store
+            .bucket_policy(&signature.namespace, &bucket_name)
+            .await
+        {
+            Ok(Some(policy)) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/json")
+                .body(Body::from(policy))
+                .expect("static policy response headers are valid"),
+            Ok(None) => s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucketPolicy",
+                "The bucket policy does not exist.",
+            ),
+            Err(error) => {
+                tracing::error!(%error, "failed to read bucket policy");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
+
+    list_objects_inner(bucket_name, query, state, signature)
+        .await
+        .map_or_else(IntoResponse::into_response, |response| response)
+}
+
+async fn list_objects_inner(
+    bucket_name: String,
+    query: HashMap<String, String>,
+    AppState {
         opendal_operator, ..
-    }): State<AppState>,
+    }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;

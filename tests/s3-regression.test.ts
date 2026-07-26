@@ -2,16 +2,28 @@ import { Database } from "bun:sqlite";
 import { SQL } from "bun";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
+import { Sha256 } from "@smithy/core/checksum";
+import { HttpRequest } from "@smithy/core/protocols";
+import { SignatureV4 } from "@smithy/signature-v4";
 import {
+	AbortMultipartUploadCommand,
 	CreateBucketCommand,
+	CopyObjectCommand,
+	CompleteMultipartUploadCommand,
+	CreateMultipartUploadCommand,
 	DeleteBucketCommand,
 	DeleteObjectCommand,
 	DeleteObjectsCommand,
+	DeleteBucketPolicyCommand,
 	GetObjectCommand,
+	GetBucketPolicyCommand,
 	HeadObjectCommand,
 	ListBucketsCommand,
+	ListPartsCommand,
 	ListObjectsV2Command,
 	PutObjectCommand,
+	PutBucketPolicyCommand,
+	UploadPartCommand,
 	S3Client,
 } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
@@ -104,6 +116,45 @@ async function rclone(args: string[]) {
 	const config = `${import.meta.dir}/.rclone-regression.conf`;
 	await Bun.write(config, rcloneConfig());
 	return run([rcloneBinary, "--config", config, ...args]);
+}
+
+async function signedDelete(body: string, contentMd5?: string) {
+	const targetUrl = new URL(`${endpoint}/${bucket}?delete`);
+	const amzDate = new Date()
+		.toISOString()
+		.replace(/[-:]/g, "")
+		.replace(/\.\d{3}Z$/, "Z");
+	const bodyHash = new Bun.CryptoHasher("sha256")
+		.update(body)
+		.digest("hex");
+	const request = new HttpRequest({
+		method: "POST",
+		protocol: targetUrl.protocol,
+		hostname: targetUrl.hostname,
+		port: targetUrl.port ? Number(targetUrl.port) : undefined,
+		path: targetUrl.pathname,
+		query: { delete: "" },
+		headers: {
+			host: targetUrl.host,
+			"content-type": "application/xml",
+			"x-amz-content-sha256": bodyHash,
+			"x-amz-date": amzDate,
+			...(contentMd5 ? { "content-md5": contentMd5 } : {}),
+		},
+		body,
+	});
+	const signer = new SignatureV4({
+		credentials: { accessKeyId, secretAccessKey },
+		region,
+		service: "s3",
+		sha256: Sha256,
+	});
+	const signed = await signer.sign(request);
+	return fetch(targetUrl, {
+		method: "POST",
+		headers: signed.headers,
+		body,
+	});
 }
 
 async function waitForEndpoint() {
@@ -351,6 +402,35 @@ describe("S3 compatibility contract", () => {
 			new GetObjectCommand({ Bucket: bucket, Key: objectKey }),
 		);
 		expect(await object.Body?.transformToString()).toBe(objectBody);
+		const range = await s3.send(
+			new GetObjectCommand({ Bucket: bucket, Key: objectKey, Range: "bytes=0-4" }),
+		);
+		expect(range.$metadata.httpStatusCode).toBe(206);
+		expect(range.ContentRange).toBe(`bytes 0-4/${objectBody.length}`);
+		expect(await range.Body?.transformToString()).toBe(objectBody.slice(0, 5));
+		await expectS3Error(
+			s3.send(
+				new GetObjectCommand({
+					Bucket: bucket,
+					Key: objectKey,
+					Range: "bytes=999999-",
+				}),
+			),
+			416,
+			["InvalidRange", "InvalidRequest"],
+		);
+		const copiedKey = "nested/copied.txt";
+		await s3.send(
+			new CopyObjectCommand({
+				Bucket: bucket,
+				Key: copiedKey,
+				CopySource: `${bucket}/${objectKey}`,
+			}),
+		);
+		const copied = await s3.send(
+			new GetObjectCommand({ Bucket: bucket, Key: copiedKey }),
+		);
+		expect(await copied.Body?.transformToString()).toBe(objectBody);
 	});
 
 	test("is usable by rclone", async () => {
@@ -358,6 +438,68 @@ describe("S3 compatibility contract", () => {
 		expect(result.stdout).toContain("hello.txt");
 		const cat = await rclone(["cat", `regression:${bucket}/${objectKey}`]);
 		expect(cat.stdout).toBe(objectBody.trim());
+	});
+
+	test("supports multipart upload lifecycle", async () => {
+		const key = "multipart/assembled.txt";
+		const initiated = await s3.send(
+			new CreateMultipartUploadCommand({ Bucket: bucket, Key: key }),
+		);
+		expect(initiated.UploadId).toBeDefined();
+		const uploadId = initiated.UploadId ?? "";
+		const firstPart = "a".repeat(5 * 1024 * 1024);
+		const first = await s3.send(
+			new UploadPartCommand({
+				Bucket: bucket,
+				Key: key,
+				UploadId: uploadId,
+				PartNumber: 1,
+				Body: firstPart,
+			}),
+		);
+		const second = await s3.send(
+			new UploadPartCommand({
+				Bucket: bucket,
+				Key: key,
+				UploadId: uploadId,
+				PartNumber: 2,
+				Body: objectBody,
+			}),
+		);
+		const listedParts = await s3.send(
+			new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
+		);
+		expect(listedParts.Parts?.map((part) => part.PartNumber)).toEqual([1, 2]);
+		await s3.send(
+			new CompleteMultipartUploadCommand({
+				Bucket: bucket,
+				Key: key,
+				UploadId: uploadId,
+				MultipartUpload: {
+					Parts: [
+						{ ETag: first.ETag, PartNumber: 1 },
+						{ ETag: second.ETag, PartNumber: 2 },
+					],
+				},
+			}),
+		);
+		const assembled = await s3.send(
+			new GetObjectCommand({ Bucket: bucket, Key: key }),
+		);
+		expect(await assembled.Body?.transformToString()).toBe(
+			firstPart + objectBody,
+		);
+		const aborted = await s3.send(
+			new CreateMultipartUploadCommand({ Bucket: bucket, Key: "multipart/aborted" }),
+		);
+		await s3.send(
+			new AbortMultipartUploadCommand({
+				Bucket: bucket,
+				Key: "multipart/aborted",
+				UploadId: aborted.UploadId,
+			}),
+		);
+		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 	});
 
 	test("enforces public and private object access", async () => {
@@ -386,7 +528,7 @@ describe("S3 compatibility contract", () => {
 			`${endpoint}/${bucket}/${privateObjectKey}`,
 		);
 		expect(privateResponse.status).toBe(403);
-		await s3.send(
+		const quietDelete = await s3.send(
 			new DeleteObjectsCommand({
 				Bucket: bucket,
 				Delete: {
@@ -395,6 +537,7 @@ describe("S3 compatibility contract", () => {
 				},
 			}),
 		);
+		expect(quietDelete.Deleted ?? []).toHaveLength(0);
 		const publicBucket = `${bucket}-public`;
 		await s3.send(
 			new CreateBucketCommand({ Bucket: publicBucket, ACL: "public-read" }),
@@ -417,6 +560,78 @@ describe("S3 compatibility contract", () => {
 			}),
 		);
 		await s3.send(new DeleteBucketCommand({ Bucket: publicBucket }));
+	});
+
+	test("stores and evaluates bucket policies", async () => {
+		if (target !== "proxy") return;
+		const policyObjectKey = "policy/public.txt";
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: policyObjectKey,
+				Body: objectBody,
+			}),
+		);
+		const policy = JSON.stringify({
+			Version: "2012-10-17",
+			Statement: [
+				{
+					Effect: "Allow",
+					Principal: "*",
+					Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+					Resource: `arn:aws:s3:::${bucket}/policy/*`,
+				},
+				{
+					Effect: "Allow",
+					Principal: "*",
+					Action: "s3:ListBucket",
+					Resource: `arn:aws:s3:::${bucket}`,
+				},
+			],
+		});
+		await s3.send(new PutBucketPolicyCommand({ Bucket: bucket, Policy: policy }));
+		const stored = await s3.send(
+			new GetBucketPolicyCommand({ Bucket: bucket }),
+		);
+		expect(JSON.parse(stored.Policy ?? "{}")).toEqual(JSON.parse(policy));
+
+		const allowed = await fetch(`${endpoint}/${bucket}/${policyObjectKey}`);
+		expect(allowed.status).toBe(200);
+		expect(await allowed.text()).toBe(objectBody);
+		const denied = await fetch(`${endpoint}/${bucket}/${objectKey}`);
+		expect(denied.status).toBe(403);
+		const anonymousPutKey = "policy/anonymous-put.txt";
+		const anonymousPut = await fetch(
+			`${endpoint}/${bucket}/${anonymousPutKey}`,
+			{ method: "PUT", body: objectBody },
+		);
+		expect(anonymousPut.status).toBe(200);
+		const anonymousList = await fetch(`${endpoint}/${bucket}?list-type=2`);
+		expect(anonymousList.status).toBe(200);
+		expect(await anonymousList.text()).toContain(anonymousPutKey);
+		const anonymousDelete = await fetch(
+			`${endpoint}/${bucket}/${anonymousPutKey}`,
+			{ method: "DELETE" },
+		);
+		expect(anonymousDelete.status).toBe(204);
+		const signedPolicyKey = "policy/signed.txt";
+		await s3.send(
+			new PutObjectCommand({ Bucket: bucket, Key: signedPolicyKey, Body: objectBody }),
+		);
+		const signedPolicyList = await s3.send(
+			new ListObjectsV2Command({ Bucket: bucket, Prefix: "policy/" }),
+		);
+		expect(signedPolicyList.Contents?.some((item) => item.Key === signedPolicyKey)).toBe(
+			true,
+		);
+		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: signedPolicyKey }));
+
+		await s3.send(new DeleteBucketPolicyCommand({ Bucket: bucket }));
+		const revoked = await fetch(`${endpoint}/${bucket}/${policyObjectKey}`);
+		expect(revoked.status).toBe(403);
+		await s3.send(
+			new DeleteObjectCommand({ Bucket: bucket, Key: policyObjectKey }),
+		);
 	});
 
 	test("lists 2000 objects through paginated responses", async () => {
@@ -501,6 +716,80 @@ describe("S3 compatibility contract", () => {
 			s3.send(new ListObjectsV2Command({ Bucket: `${bucket}-missing` })),
 			404,
 			["NoSuchBucket", "NotFound"],
+		);
+	});
+
+	test("rejects malformed multi-object delete XML", async () => {
+		if (target !== "proxy") return;
+		const response = await signedDelete("<Delete><Object>");
+		expect(response.status).toBe(400);
+		expect(await response.text()).toContain("MalformedXML");
+	});
+
+	test("rejects an invalid multi-object delete Content-MD5", async () => {
+		if (target !== "proxy") return;
+		const response = await signedDelete(
+			"<Delete><Object><Key>missing.txt</Key></Object></Delete>",
+			"AAAAAAAAAAAAAAAAAAAAAA==",
+		);
+		expect(response.status).toBe(400);
+		expect(await response.text()).toContain("BadDigest");
+	});
+
+	test("returns per-object delete failures", async () => {
+		if (target !== "proxy" || opendalProvider !== "fs") return;
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: "delete-failure/child.txt",
+				Body: objectBody,
+			}),
+		);
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: "delete-success.txt",
+				Body: objectBody,
+			}),
+		);
+		const result = await s3.send(
+			new DeleteObjectsCommand({
+				Bucket: bucket,
+				Delete: {
+					Objects: [
+						{ Key: "delete-failure" },
+						{ Key: "delete-success.txt" },
+					],
+				},
+			}),
+		);
+		expect(result.Deleted?.map(({ Key }) => Key)).toEqual([
+			"delete-success.txt",
+		]);
+		expect(result.Errors?.map(({ Key }) => Key)).toContain("delete-failure");
+		await s3.send(
+			new DeleteObjectCommand({
+				Bucket: bucket,
+				Key: "delete-failure/child.txt",
+			}),
+		);
+	});
+
+	test("rejects more than 1000 objects in a multi-object delete", async () => {
+		if (target !== "proxy") return;
+		await expectS3Error(
+			s3.send(
+				new DeleteObjectsCommand({
+					Bucket: bucket,
+					Delete: {
+						Objects: Array.from({ length: 1001 }, (_, index) => ({
+							Key: `too-many/${index}`,
+						})),
+					},
+				}),
+			),
+			400,
+			["MalformedXML", "InvalidRequest"],
 		);
 	});
 
@@ -590,6 +879,9 @@ describe("S3 compatibility contract", () => {
 			"already-missing.txt",
 		]);
 		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey }));
+		await s3.send(
+			new DeleteObjectCommand({ Bucket: bucket, Key: "nested/copied.txt" }),
+		);
 		await s3.send(
 			new DeleteObjectCommand({ Bucket: bucket, Key: "uploads/posted.txt" }),
 		);
