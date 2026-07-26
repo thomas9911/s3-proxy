@@ -84,4 +84,29 @@ pub trait MetadataStore: Send + Sync {
     }
 
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>>;
+
+    async fn set_bucket_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        public: bool,
+    ) -> anyhow::Result<()>;
+
+    async fn public_bucket_namespace(&self, bucket: &str) -> anyhow::Result<Option<String>>;
+
+    async fn set_object_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+        public: bool,
+    ) -> anyhow::Result<()>;
+
+    async fn public_object_namespace(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<Option<String>>;
+
+    async fn delete_public_bucket(&self, namespace: &str, bucket: &str) -> anyhow::Result<()>;
 }

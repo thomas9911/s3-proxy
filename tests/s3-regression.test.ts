@@ -360,6 +360,65 @@ describe("S3 compatibility contract", () => {
 		expect(cat.stdout).toBe(objectBody.trim());
 	});
 
+	test("enforces public and private object access", async () => {
+		if (target !== "proxy") return;
+		const publicObjectKey = "public/object.txt";
+		const privateObjectKey = "private/object.txt";
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: publicObjectKey,
+				Body: objectBody,
+				ACL: "public-read",
+			}),
+		);
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: privateObjectKey,
+				Body: objectBody,
+			}),
+		);
+		const publicResponse = await fetch(`${endpoint}/${bucket}/${publicObjectKey}`);
+		expect(publicResponse.status).toBe(200);
+		expect(await publicResponse.text()).toBe(objectBody);
+		const privateResponse = await fetch(
+			`${endpoint}/${bucket}/${privateObjectKey}`,
+		);
+		expect(privateResponse.status).toBe(403);
+		await s3.send(
+			new DeleteObjectsCommand({
+				Bucket: bucket,
+				Delete: {
+					Objects: [{ Key: publicObjectKey }, { Key: privateObjectKey }],
+					Quiet: true,
+				},
+			}),
+		);
+		const publicBucket = `${bucket}-public`;
+		await s3.send(
+			new CreateBucketCommand({ Bucket: publicBucket, ACL: "public-read" }),
+		);
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: publicBucket,
+				Key: "bucket-public.txt",
+				Body: objectBody,
+			}),
+		);
+		const publicBucketResponse = await fetch(
+			`${endpoint}/${publicBucket}/bucket-public.txt`,
+		);
+		expect(publicBucketResponse.status).toBe(200);
+		await s3.send(
+			new DeleteObjectCommand({
+				Bucket: publicBucket,
+				Key: "bucket-public.txt",
+			}),
+		);
+		await s3.send(new DeleteBucketCommand({ Bucket: publicBucket }));
+	});
+
 	test("lists 2000 objects through paginated responses", async () => {
 		const started = performance.now();
 		const objects = Array.from({ length: 2000 }, (_, index) => ({

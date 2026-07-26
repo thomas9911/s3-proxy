@@ -39,6 +39,17 @@ impl SqlMetadataStore {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS public_resources (
+                resource_type TEXT NOT NULL,
+                namespace TEXT NOT NULL,
+                bucket TEXT NOT NULL,
+                object TEXT NOT NULL,
+                PRIMARY KEY (resource_type, bucket, object)
+            )",
+        )
+        .execute(&pool)
+        .await?;
         Ok(Self { pool, postgres })
     }
 
@@ -48,6 +59,74 @@ impl SqlMetadataStore {
         } else {
             "?".to_string()
         }
+    }
+
+    async fn set_public_resource(
+        &self,
+        resource_type: &str,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+        public: bool,
+    ) -> anyhow::Result<()> {
+        if public {
+            let query = format!(
+                "INSERT INTO public_resources (resource_type, namespace, bucket, object)
+                 VALUES ({}, {}, {}, {})
+                 ON CONFLICT(resource_type, bucket, object)
+                 DO UPDATE SET namespace = excluded.namespace",
+                self.placeholder(1),
+                self.placeholder(2),
+                self.placeholder(3),
+                self.placeholder(4),
+            );
+            sqlx::query(AssertSqlSafe(query))
+                .bind(resource_type)
+                .bind(namespace)
+                .bind(bucket)
+                .bind(object)
+                .execute(&self.pool)
+                .await?;
+        } else {
+            let query = format!(
+                "DELETE FROM public_resources
+                 WHERE resource_type = {} AND namespace = {} AND bucket = {} AND object = {}",
+                self.placeholder(1),
+                self.placeholder(2),
+                self.placeholder(3),
+                self.placeholder(4),
+            );
+            sqlx::query(AssertSqlSafe(query))
+                .bind(resource_type)
+                .bind(namespace)
+                .bind(bucket)
+                .bind(object)
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn public_resource_namespace(
+        &self,
+        resource_type: &str,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let query = format!(
+            "SELECT namespace FROM public_resources
+             WHERE resource_type = {} AND bucket = {} AND object = {}
+             LIMIT 1",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        Ok(sqlx::query_scalar(AssertSqlSafe(query))
+            .bind(resource_type)
+            .bind(bucket)
+            .bind(object)
+            .fetch_optional(&self.pool)
+            .await?)
     }
 }
 
@@ -209,6 +288,54 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(like_pattern)
         .fetch_all(&self.pool)
         .await?)
+    }
+
+    async fn set_bucket_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        public: bool,
+    ) -> anyhow::Result<()> {
+        self.set_public_resource("bucket", namespace, bucket, "", public)
+            .await
+    }
+
+    async fn public_bucket_namespace(&self, bucket: &str) -> anyhow::Result<Option<String>> {
+        self.public_resource_namespace("bucket", bucket, "").await
+    }
+
+    async fn set_object_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+        public: bool,
+    ) -> anyhow::Result<()> {
+        self.set_public_resource("object", namespace, bucket, object, public)
+            .await
+    }
+
+    async fn public_object_namespace(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.public_resource_namespace("object", bucket, object)
+            .await
+    }
+
+    async fn delete_public_bucket(&self, namespace: &str, bucket: &str) -> anyhow::Result<()> {
+        let query = format!(
+            "DELETE FROM public_resources WHERE namespace = {} AND bucket = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 

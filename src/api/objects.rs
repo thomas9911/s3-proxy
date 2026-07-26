@@ -1,8 +1,10 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
 use crate::{metadata::ObjectMetadata, AppState};
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::header::{HeaderName, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED};
+use axum::extract::{FromRequest, Path, Request, State};
+use axum::http::header::{
+    HeaderName, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
@@ -75,20 +77,30 @@ pub async fn create_object(
             )
             .await?;
     }
+    if let Some(public) = public_acl(&header_map) {
+        metadata_store
+            .set_object_public(&namespace, &bucket_name, &object_name, public)
+            .await?;
+    }
 
     Ok("OK".into_response())
 }
 
 pub async fn get_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
-    State(AppState {
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, RouteError> {
+    let namespace = match resolve_read_namespace(request, &state, &bucket_name, &object_name).await
+    {
+        Ok(namespace) => namespace,
+        Err(response) => return Ok(response),
+    };
+    let AppState {
         metadata_store,
         opendal_operator,
         ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<Response, RouteError> {
-    let namespace = signature.namespace;
+    } = state;
 
     if !opendal_operator
         .exists(&format!("{}/{}/", namespace, bucket_name))
@@ -154,14 +166,19 @@ pub async fn get_object(
 
 pub async fn head_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
-    State(AppState {
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, RouteError> {
+    let namespace = match resolve_read_namespace(request, &state, &bucket_name, &object_name).await
+    {
+        Ok(namespace) => namespace,
+        Err(response) => return Ok(response),
+    };
+    let AppState {
         metadata_store,
         opendal_operator,
         ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<Response, RouteError> {
-    let namespace = signature.namespace;
+    } = state;
     let bucket_path = format!("{}/{}/", namespace, bucket_name);
     if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
@@ -236,7 +253,53 @@ pub async fn delete_object(
     metadata_store
         .delete_object_metadata(&namespace, &bucket_name, &object_name)
         .await?;
+    metadata_store
+        .set_object_public(&namespace, &bucket_name, &object_name, false)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
+    headers
+        .get("x-amz-acl")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| match value {
+            "public-read" => Some(true),
+            "private" => Some(false),
+            _ => None,
+        })
+}
+
+async fn resolve_read_namespace(
+    request: Request,
+    state: &AppState,
+    bucket_name: &str,
+    object_name: &str,
+) -> Result<String, Response<Body>> {
+    if request.headers().contains_key(AUTHORIZATION) {
+        return VerifiedRequest::from_request(request, state)
+            .await
+            .map(|request| request.namespace)
+            .map_err(IntoResponse::into_response);
+    }
+
+    state
+        .metadata_store
+        .public_object_namespace(bucket_name, object_name)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve public object");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+        .or(state
+            .metadata_store
+            .public_bucket_namespace(bucket_name)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to resolve public bucket");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?)
+        .ok_or_else(|| s3_error_response(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"))
 }
 
 async fn add_user_metadata(

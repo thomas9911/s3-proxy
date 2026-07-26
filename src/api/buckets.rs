@@ -1,6 +1,7 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
 use crate::{templates, AppState};
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
@@ -47,8 +48,11 @@ pub async fn list_buckets(
 
 pub async fn create_bucket(
     Path(bucket_name): Path<String>,
+    header_map: HeaderMap,
     State(AppState {
-        opendal_operator, ..
+        metadata_store,
+        opendal_operator,
+        ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
@@ -65,13 +69,21 @@ pub async fn create_bucket(
         .create_dir(&format!("{}/{}/", namespace, bucket_name))
         .await?;
 
+    if let Some(public) = super::objects::public_acl(&header_map) {
+        metadata_store
+            .set_bucket_public(namespace, &bucket_name, public)
+            .await?;
+    }
+
     Ok("OK".into_response())
 }
 
 pub async fn delete_bucket(
     Path(bucket_name): Path<String>,
     State(AppState {
-        opendal_operator, ..
+        metadata_store,
+        opendal_operator,
+        ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
@@ -87,6 +99,9 @@ pub async fn delete_bucket(
     opendal_operator
         .delete_with(&bucket_path)
         .recursive(true)
+        .await?;
+    metadata_store
+        .delete_public_bucket(&namespace, &bucket_name)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -96,8 +96,78 @@ impl MetadataStore for RedisMetadataStore {
         let mut connection = self.pool.get().await?;
         Ok(connection.keys(pattern).await?)
     }
+
+    async fn set_bucket_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        public: bool,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let key = public_bucket_key(bucket);
+        if public {
+            let _: () = connection.set(key, namespace).await?;
+        } else {
+            let _: () = connection.del(key).await?;
+        }
+        Ok(())
+    }
+
+    async fn public_bucket_namespace(&self, bucket: &str) -> anyhow::Result<Option<String>> {
+        let mut connection = self.pool.get().await?;
+        Ok(connection.get(public_bucket_key(bucket)).await?)
+    }
+
+    async fn set_object_public(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        object: &str,
+        public: bool,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let key = public_object_key(bucket, object);
+        if public {
+            let _: () = connection.set(key, namespace).await?;
+        } else {
+            let _: () = connection.del(key).await?;
+        }
+        Ok(())
+    }
+
+    async fn public_object_namespace(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut connection = self.pool.get().await?;
+        Ok(connection.get(public_object_key(bucket, object)).await?)
+    }
+
+    async fn delete_public_bucket(&self, _namespace: &str, bucket: &str) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let keys: Vec<String> = connection.keys(public_object_key(bucket, "*")).await?;
+        if !keys.is_empty() {
+            let _: Vec<i32> = deadpool_redis::redis::pipe()
+                .del(keys)
+                .del(public_bucket_key(bucket))
+                .query_async(&mut connection)
+                .await?;
+        } else {
+            let _: () = connection.del(public_bucket_key(bucket)).await?;
+        }
+        Ok(())
+    }
 }
 
 fn object_metadata_key(namespace: &str, bucket: &str, object: &str) -> String {
     format!("object_metadata::{namespace}/{bucket}/{object}")
+}
+
+fn public_bucket_key(bucket: &str) -> String {
+    format!("public_bucket::{bucket}")
+}
+
+fn public_object_key(bucket: &str, object: &str) -> String {
+    format!("public_object::{bucket}/{object}")
 }
