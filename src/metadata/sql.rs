@@ -171,6 +171,35 @@ impl MetadataStore for SqliteMetadataStore {
         Ok(())
     }
 
+    async fn delete_many_object_metadata(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        objects: &[&str],
+    ) -> anyhow::Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let placeholders = (0..objects.len())
+            .map(|index| self.placeholder(index + 3))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "DELETE FROM object_metadata
+             WHERE namespace = {} AND bucket = {} AND object IN ({placeholders})",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        let mut query = sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(bucket);
+        for object in objects {
+            query = query.bind(object);
+        }
+        query.execute(&self.pool).await?;
+        Ok(())
+    }
+
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let like_pattern = pattern.replace('*', "%");
         Ok(sqlx::query_scalar(AssertSqlSafe(format!(
@@ -218,6 +247,17 @@ mod tests {
                 .await
                 .unwrap(),
             metadata
+        );
+        store
+            .delete_many_object_metadata("access", "bucket", &["object", "missing"])
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .object_metadata("access", "bucket", "object")
+                .await
+                .unwrap(),
+            ObjectMetadata::default()
         );
     }
 }

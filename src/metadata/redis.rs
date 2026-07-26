@@ -74,6 +74,24 @@ impl MetadataStore for RedisMetadataStore {
         Ok(())
     }
 
+    async fn delete_many_object_metadata(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        objects: &[&str],
+    ) -> anyhow::Result<()> {
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let mut connection = self.pool.get().await?;
+        let mut pipeline = deadpool_redis::redis::pipe();
+        for object in objects {
+            pipeline.del(object_metadata_key(namespace, bucket, object));
+        }
+        let _: Vec<i32> = pipeline.query_async(&mut connection).await?;
+        Ok(())
+    }
+
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>> {
         let mut connection = self.pool.get().await?;
         Ok(connection.keys(pattern).await?)

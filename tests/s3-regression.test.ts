@@ -6,6 +6,7 @@ import {
 	CreateBucketCommand,
 	DeleteBucketCommand,
 	DeleteObjectCommand,
+	DeleteObjectsCommand,
 	GetObjectCommand,
 	HeadObjectCommand,
 	ListBucketsCommand,
@@ -413,12 +414,16 @@ describe("S3 compatibility contract", () => {
 
 		const deletionStarted = performance.now();
 		for (let offset = 0; offset < objects.length; offset += batchSize) {
-			await Promise.all(
-				objects
-					.slice(offset, offset + batchSize)
-					.map(({ Key }) =>
-						s3.send(new DeleteObjectCommand({ Bucket: bucket, Key })),
-					),
+			await s3.send(
+				new DeleteObjectsCommand({
+					Bucket: bucket,
+					Delete: {
+						Objects: objects
+							.slice(offset, offset + batchSize)
+							.map(({ Key }) => ({ Key })),
+						Quiet: true,
+					},
+				}),
 			);
 		}
 		if (profileRegression)
@@ -503,6 +508,28 @@ describe("S3 compatibility contract", () => {
 	});
 
 	test("deletes objects and buckets", async () => {
+		await Promise.all(
+			["bulk-delete-a.txt", "bulk-delete-b.txt"].map((Key) =>
+				s3.send(new PutObjectCommand({ Bucket: bucket, Key, Body: objectBody })),
+			),
+		);
+		const deleteResult = await s3.send(
+			new DeleteObjectsCommand({
+				Bucket: bucket,
+				Delete: {
+					Objects: [
+						{ Key: "bulk-delete-a.txt" },
+						{ Key: "bulk-delete-b.txt" },
+						{ Key: "already-missing.txt" },
+					],
+				},
+			}),
+		);
+		expect(deleteResult.Deleted?.map(({ Key }) => Key)).toEqual([
+			"bulk-delete-a.txt",
+			"bulk-delete-b.txt",
+			"already-missing.txt",
+		]);
 		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: objectKey }));
 		await s3.send(
 			new DeleteObjectCommand({ Bucket: bucket, Key: "uploads/posted.txt" }),

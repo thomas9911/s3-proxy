@@ -44,6 +44,35 @@ pub struct ListObjectsTemplate<'a> {
     pub common_prefixes: &'a [ListCommonPrefix<'a>],
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Delete")]
+pub struct DeleteObjectsRequest {
+    #[serde(rename = "Object", default)]
+    pub objects: Vec<DeleteObjectIdentifier>,
+    #[serde(rename = "Quiet", default)]
+    pub quiet: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DeleteObjectIdentifier {
+    pub key: String,
+}
+
+#[derive(Debug, Template, WebTemplate)]
+#[template(path = "delete_objects.xml")]
+pub struct DeleteObjectsTemplate<'a> {
+    pub deleted: &'a [String],
+    pub errors: &'a [DeleteObjectError],
+}
+
+#[derive(Debug)]
+pub struct DeleteObjectError {
+    pub key: String,
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub struct CreateBucket {

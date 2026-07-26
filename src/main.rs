@@ -136,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
             get(api::list_objects)
                 .put(api::create_bucket)
                 .delete(api::delete_bucket)
-                .post(api::post_object),
+                .post(api::post_bucket),
         )
         .route(
             "/{bucket_name}/{*object_name}",

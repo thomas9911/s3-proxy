@@ -1,12 +1,42 @@
 use crate::signature::s3_error_response;
-use crate::{metadata::ObjectMetadata, AppState};
+use crate::signature::VerifiedRequest;
+use crate::{metadata::ObjectMetadata, templates, AppState};
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
-use axum::extract::{Multipart, Path, State};
-use axum::http::StatusCode;
+use axum::extract::{FromRequest, Multipart, Path, Request, State};
+use axum::http::header::HeaderName;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
 use base64::Engine;
+use futures_util::stream::StreamExt as FuturesStreamExt;
+use md5::{Digest, Md5};
 use std::collections::HashMap;
+
+const CONTENT_MD5: HeaderName = HeaderName::from_static("content-md5");
+
+pub async fn post_bucket(
+    Path(bucket_name): Path<String>,
+    State(state): State<AppState>,
+    request: Request,
+) -> Result<Response, RouteError> {
+    let is_delete = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|parameter| parameter == "delete" || parameter.starts_with("delete="));
+    if is_delete {
+        let content_md5 = request.headers().get(CONTENT_MD5).cloned();
+        let verified = match VerifiedRequest::from_request(request, &state).await {
+            Ok(verified) => verified,
+            Err(error) => return Ok(error.into_response()),
+        };
+        return delete_objects(bucket_name, state, verified, content_md5).await;
+    }
+
+    let multipart = Multipart::from_request(request, &state).await?;
+    post_object(Path(bucket_name), State(state), multipart).await
+}
 
 pub async fn post_object(
     Path(bucket_name): Path<String>,
@@ -189,6 +219,144 @@ pub async fn post_object(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn delete_objects(
+    bucket_name: String,
+    AppState {
+        metadata_store,
+        opendal_operator,
+        ..
+    }: AppState,
+    signature: VerifiedRequest,
+    content_md5: Option<HeaderValue>,
+) -> Result<Response, RouteError> {
+    let expected_md5 = content_md5.and_then(|value| value.to_str().ok().map(ToOwned::to_owned));
+    let actual_md5 =
+        base64::engine::general_purpose::STANDARD.encode(Md5::digest(&signature.bytes));
+    if expected_md5
+        .as_deref()
+        .is_some_and(|expected| expected != actual_md5)
+    {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "BadDigest",
+            "The Content-MD5 you specified did not match what we received.",
+        ));
+    }
+
+    let namespace = signature.namespace;
+    if !opendal_operator
+        .exists(&format!("{namespace}/{bucket_name}/"))
+        .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    }
+
+    let request: templates::DeleteObjectsRequest =
+        match quick_xml::de::from_reader(signature.bytes.as_ref()) {
+            Ok(request) => request,
+            Err(_) => {
+                return Ok(s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "MalformedXML",
+                    "The XML you provided was not well-formed or did not validate against our published schema.",
+                ))
+            }
+        };
+    if request.objects.is_empty() || request.objects.len() > 1000 {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "You must specify between 1 and 1000 objects.",
+        ));
+    }
+
+    let quiet = request.quiet;
+    let object_batches = request
+        .objects
+        .chunks(20)
+        .map(|batch| batch.to_vec())
+        .collect::<Vec<_>>();
+    let results = tokio_stream::iter(object_batches.into_iter().map(|objects| {
+        let metadata_store = metadata_store.clone();
+        let opendal_operator = opendal_operator.clone();
+        let namespace = namespace.clone();
+        let bucket_name = bucket_name.clone();
+        async move {
+            delete_batch(
+                &opendal_operator,
+                &metadata_store,
+                &namespace,
+                &bucket_name,
+                objects,
+            )
+            .await
+        }
+    }))
+    .buffered(20)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut deleted = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(keys) => deleted.extend(keys),
+            Err(error) => errors.push(error),
+        }
+    }
+    let template = templates::DeleteObjectsTemplate {
+        deleted: if quiet { &[] } else { &deleted },
+        errors: &errors,
+    };
+    Ok(template.into_response())
+}
+
+async fn delete_batch(
+    opendal_operator: &opendal::Operator,
+    metadata_store: &std::sync::Arc<dyn crate::metadata::MetadataStore>,
+    namespace: &str,
+    bucket_name: &str,
+    objects: Vec<templates::DeleteObjectIdentifier>,
+) -> Result<Vec<String>, templates::DeleteObjectError> {
+    let mut deleter = opendal_operator
+        .deleter()
+        .await
+        .map_err(|error| delete_error(String::new(), error))?;
+    for object in &objects {
+        let filepath = format!("{namespace}/{bucket_name}/{}", object.key);
+        deleter
+            .delete(filepath)
+            .await
+            .map_err(|error| delete_error(object.key.clone(), error))?;
+    }
+    deleter
+        .close()
+        .await
+        .map_err(|error| delete_error(String::new(), error))?;
+
+    let object_names = objects
+        .iter()
+        .map(|object| object.key.as_str())
+        .collect::<Vec<_>>();
+    metadata_store
+        .delete_many_object_metadata(namespace, bucket_name, &object_names)
+        .await
+        .map_err(|error| delete_error(String::new(), error))?;
+    Ok(objects.into_iter().map(|object| object.key).collect())
+}
+
+fn delete_error(key: String, error: impl std::fmt::Display) -> templates::DeleteObjectError {
+    templates::DeleteObjectError {
+        key,
+        code: "InternalError".to_string(),
+        message: error.to_string(),
+    }
 }
 
 fn policy_allows(

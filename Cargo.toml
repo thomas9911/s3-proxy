@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.0"
+md-5 = "0.10.6"
 askama = "0.16.0"
 askama_web = { version = "0.16.0", features = ["axum-0.8"] }
 async-trait = "0.1.91"
@@ -19,6 +20,7 @@ axum-extra = { version = "0.12.6", features = ["typed-header"] }
 axum-route-error = "5.1.0"
 config = { version = "0.15.25", default-features = false }
 deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1", "serde"] }
+futures-util = "0.3.33"
 headers = "0.4.1"
 httpdate = "1.0.3"
 opendal = {

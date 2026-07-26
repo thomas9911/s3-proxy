@@ -70,5 +70,18 @@ pub trait MetadataStore: Send + Sync {
         object: &str,
     ) -> anyhow::Result<()>;
 
+    async fn delete_many_object_metadata(
+        &self,
+        namespace: &str,
+        bucket: &str,
+        objects: &[&str],
+    ) -> anyhow::Result<()> {
+        for object in objects {
+            self.delete_object_metadata(namespace, bucket, object)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn debug_keys(&self, pattern: &str) -> anyhow::Result<Vec<String>>;
 }
