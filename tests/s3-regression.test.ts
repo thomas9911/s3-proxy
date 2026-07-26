@@ -24,6 +24,14 @@ const endpoint = process.env.S3_TEST_ENDPOINT ?? "http://127.0.0.1:19000";
 const accessKeyId = process.env.S3_TEST_ACCESS_KEY ?? "minioadmin";
 const secretAccessKey = process.env.S3_TEST_SECRET_KEY ?? "minioadmin";
 const region = process.env.S3_TEST_REGION ?? "us-east-1";
+const profileRegression = process.env.S3_TEST_PROFILE === "1";
+const configuredBatchSize = Number.parseInt(
+	process.env.S3_TEST_BATCH_SIZE ?? "200",
+	10,
+);
+const batchSize = Number.isFinite(configuredBatchSize)
+	? Math.max(1, configuredBatchSize)
+	: 200;
 const bucket = `regression-${Date.now().toString(36)}`;
 const objectKey = "nested/hello.txt";
 const objectBody = "s3-proxy regression test\n";
@@ -207,8 +215,10 @@ async function startTarget() {
 				[accessKeyId, secretAccessKey],
 			);
 			database.close();
-		}
-		proxyProcess = Bun.spawn(["cargo", "run", "--quiet"], {
+    }
+    const cargoRunArgs = ["cargo", "run", "--quiet"];
+    cargoRunArgs.push("--release");
+		proxyProcess = Bun.spawn(cargoRunArgs, {
 			env: {
 				...process.env,
 				S3_PROXY__SERVER_HOST: "0.0.0.0:19000",
@@ -350,21 +360,27 @@ describe("S3 compatibility contract", () => {
 	});
 
 	test("lists 2000 objects through paginated responses", async () => {
+		const started = performance.now();
 		const objects = Array.from({ length: 2000 }, (_, index) => ({
 			Key: `bulk/${index.toString().padStart(4, "0")}.txt`,
 			Body: `bulk object ${index}`,
 		}));
-		for (let offset = 0; offset < objects.length; offset += 50) {
+		for (let offset = 0; offset < objects.length; offset += batchSize) {
 			await Promise.all(
 				objects
-					.slice(offset, offset + 50)
+					.slice(offset, offset + batchSize)
 					.map((object) =>
 						s3.send(new PutObjectCommand({ Bucket: bucket, ...object })),
 					),
 			);
 		}
+		if (profileRegression)
+			console.log(
+				`[profile] upload: ${(performance.now() - started).toFixed(0)}ms`,
+			);
 
 		const keys: string[] = [];
+		const listingStarted = performance.now();
 		let continuationToken: string | undefined;
 		let pageCount = 0;
 		do {
@@ -384,6 +400,10 @@ describe("S3 compatibility contract", () => {
 			);
 			continuationToken = page.NextContinuationToken;
 		} while (continuationToken);
+		if (profileRegression)
+			console.log(
+				`[profile] list: ${(performance.now() - listingStarted).toFixed(0)}ms`,
+			);
 
 		expect(pageCount).toBe(2);
 		expect(keys).toHaveLength(2000);
@@ -391,15 +411,20 @@ describe("S3 compatibility contract", () => {
 		expect(keys).toContain("bulk/0000.txt");
 		expect(keys).toContain("bulk/1999.txt");
 
-		for (let offset = 0; offset < objects.length; offset += 50) {
+		const deletionStarted = performance.now();
+		for (let offset = 0; offset < objects.length; offset += batchSize) {
 			await Promise.all(
 				objects
-					.slice(offset, offset + 50)
+					.slice(offset, offset + batchSize)
 					.map(({ Key }) =>
 						s3.send(new DeleteObjectCommand({ Bucket: bucket, Key })),
 					),
 			);
 		}
+		if (profileRegression)
+			console.log(
+				`[profile] delete: ${(performance.now() - deletionStarted).toFixed(0)}ms, total: ${(performance.now() - started).toFixed(0)}ms`,
+			);
 	}, 30_000);
 
 	test("returns S3 errors for missing resources", async () => {

@@ -11,13 +11,10 @@ pub struct SqlMetadataStore {
 impl SqlMetadataStore {
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
         sqlx::any::install_default_drivers();
-        let max_connections = if database_url == "sqlite::memory:" {
-            1
-        } else {
-            5
-        };
         let postgres =
             database_url.starts_with("postgres://") || database_url.starts_with("postgresql://");
+        // SQLite serializes writes; PostgreSQL benefits from parallel request-level queries.
+        let max_connections = if postgres { 20 } else { 1 };
         let pool = AnyPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
@@ -94,28 +91,38 @@ impl MetadataStore for SqliteMetadataStore {
         }
 
         let mut transaction = self.pool.begin().await?;
-        let query = format!(
+        let mut values = String::new();
+        for index in 0..metadata.len() {
+            if index > 0 {
+                values.push_str(", ");
+            }
+            let first = index * 5 + 1;
+            values.push_str(&format!(
+                "({}, {}, {}, {}, {})",
+                self.placeholder(first),
+                self.placeholder(first + 1),
+                self.placeholder(first + 2),
+                self.placeholder(first + 3),
+                self.placeholder(first + 4),
+            ));
+        }
+        let query_string = format!(
             "INSERT INTO object_metadata
                 (namespace, bucket, object, metadata_key, metadata_value)
-             VALUES ({}, {}, {}, {}, {})
+             VALUES {values}
              ON CONFLICT(namespace, bucket, object, metadata_key)
-             DO UPDATE SET metadata_value = excluded.metadata_value",
-            self.placeholder(1),
-            self.placeholder(2),
-            self.placeholder(3),
-            self.placeholder(4),
-            self.placeholder(5),
+             DO UPDATE SET metadata_value = excluded.metadata_value"
         );
+        let mut query = sqlx::query(AssertSqlSafe(query_string));
         for (key, value) in metadata {
-            sqlx::query(AssertSqlSafe(query.clone()))
+            query = query
                 .bind(namespace)
                 .bind(bucket)
                 .bind(object)
                 .bind(key)
-                .bind(value)
-                .execute(&mut *transaction)
-                .await?;
+                .bind(value);
         }
+        query.execute(&mut *transaction).await?;
         transaction.commit().await?;
         Ok(())
     }

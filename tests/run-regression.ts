@@ -17,45 +17,47 @@ function run(label: string, variables: Record<string, string>) {
 	}
 }
 
-// if (externalEndpoint) {
-// 	run("external", {
-// 		S3_TEST_TARGET: "external",
-// 		S3_TEST_ENDPOINT: externalEndpoint,
-// 	});
-// } else {
-// 	run("MinIO in Docker", {
-// 		S3_TEST_TARGET: "minio",
-// 		S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
-// 	});
-// }
+const externalEndpoint = null;
 
-// run("proxy with Redis", {
-// 	S3_TEST_TARGET: "proxy",
-// 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
-// 	S3_TEST_METADATA_BACKEND: "redis",
-// 	S3_TEST_OPENDAL_PROVIDER: "memory",
-// });
+if (externalEndpoint) {
+	run("external", {
+		S3_TEST_TARGET: "external",
+		S3_TEST_ENDPOINT: externalEndpoint,
+	});
+} else {
+	run("MinIO in Docker", {
+		S3_TEST_TARGET: "minio",
+		S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	});
+}
 
-// run("proxy with SQLite", {
-// 	S3_TEST_TARGET: "proxy",
-// 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
-// 	S3_TEST_METADATA_BACKEND: "sqlite",
-// 	S3_TEST_OPENDAL_PROVIDER: "memory",
-// });
+run("proxy with Redis metadata", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "redis",
+	S3_TEST_OPENDAL_PROVIDER: "memory",
+});
 
-// run("proxy with FS", {
-// 	S3_TEST_TARGET: "proxy",
-// 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
-// 	S3_TEST_METADATA_BACKEND: "sqlite",
-// 	S3_TEST_OPENDAL_PROVIDER: "fs",
-// });
+run("proxy with SQLite metadata", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "memory",
+});
 
-// run("proxy with Sled", {
-// 	S3_TEST_TARGET: "proxy",
-// 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
-// 	S3_TEST_METADATA_BACKEND: "sqlite",
-// 	S3_TEST_OPENDAL_PROVIDER: "sled",
-// });
+run("proxy with FS", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "fs",
+});
+
+run("proxy with Sled", {
+	S3_TEST_TARGET: "proxy",
+	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+	S3_TEST_METADATA_BACKEND: "sqlite",
+	S3_TEST_OPENDAL_PROVIDER: "sled",
+});
 
 run("proxy with PostgreSQL metadata", {
 	S3_TEST_TARGET: "proxy",
