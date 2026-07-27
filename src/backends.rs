@@ -3,20 +3,17 @@ use std::collections::HashMap;
 
 pub fn probe() {
     let schemes = [
-        "azblob",
         "b2",
         "cloudflare-kv",
         "compfs",
         "cos",
         "dashmap",
         "fs",
-        "gcs",
         "github",
         "koofr",
         "memory",
         "mini-moka",
         "moka",
-        "mysql",
         "obs",
         "oss",
         "s3",
@@ -101,7 +98,7 @@ pub fn probe() {
         };
         match operator {
             Ok(operator) => {
-                let capability = operator.info().full_capability();
+                let capability = operator.info().capability();
                 println!(
                     "{scheme} => proxy_compatibility={} {:?}",
                     proxy_compatibility(&capability),

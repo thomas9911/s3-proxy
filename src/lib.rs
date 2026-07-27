@@ -29,9 +29,14 @@ pub struct Config {
     #[serde(default = "default_metadata_backend")]
     pub metadata_backend: metadata::MetaDataBackend,
     pub redis: Option<deadpool_redis::Config>,
+    #[serde(default = "default_sqlite")]
     pub sqlite: Option<SqliteConfig>,
     pub postgres: Option<PostgresConfig>,
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+    #[serde(default = "default_opendal_provider")]
     pub opendal_provider: String,
+    #[serde(default)]
     pub opendal: HashMap<String, String>,
 }
 
@@ -45,6 +50,12 @@ pub struct PostgresConfig {
     pub url: String,
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminConfig {
+    pub access_key: String,
+    pub secret_key: String,
+}
+
 fn default_host() -> String {
     String::from("0.0.0.0:3000")
 }
@@ -54,7 +65,17 @@ fn default_external_host() -> String {
 }
 
 fn default_metadata_backend() -> metadata::MetaDataBackend {
-    metadata::MetaDataBackend::Redis
+    metadata::MetaDataBackend::Sqlite
+}
+
+fn default_opendal_provider() -> String {
+    String::from("memory")
+}
+
+fn default_sqlite() -> Option<SqliteConfig> {
+    Some(SqliteConfig {
+        url: String::from("sqlite::memory:"),
+    })
 }
 
 impl Config {
@@ -100,6 +121,17 @@ impl AppState {
                     Arc::new(metadata::PostgresMetadataStore::connect(&postgres_config.url).await?)
                 }
             };
+        if let Some(admin) = config.admin.as_ref() {
+            if metadata_store
+                .secret_key(&admin.access_key)
+                .await?
+                .is_none()
+            {
+                metadata_store
+                    .set_secret_key(&admin.access_key, &admin.secret_key)
+                    .await?;
+            }
+        }
         let operator = Operator::via_iter(&config.opendal_provider, config.opendal.clone())?
             .layer(opendal::layers::TracingLayer::new());
 
@@ -140,6 +172,21 @@ pub fn build_app(app_state: AppState) -> Router {
             )
         })
         .with_state(app_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{metadata::MetaDataBackend, Config};
+
+    #[test]
+    fn config_defaults_to_in_memory_services() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+
+        assert!(matches!(config.metadata_backend, MetaDataBackend::Sqlite));
+        assert_eq!(config.sqlite.unwrap().url, "sqlite::memory:");
+        assert_eq!(config.opendal_provider, "memory");
+        assert!(config.opendal.is_empty());
+    }
 }
 
 async fn metadata_debug(

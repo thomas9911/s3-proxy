@@ -158,7 +158,7 @@ mod tests {
             .set_bucket_public("namespace", "bucket", true)
             .await
             .unwrap();
-        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let operator = Operator::new(Memory::default()).unwrap();
         operator.create_dir("namespace/bucket/").await.unwrap();
         operator
             .write("namespace/bucket/object.txt", b"object".to_vec())
@@ -175,6 +175,7 @@ mod tests {
                     url: "sqlite::memory:".to_string(),
                 }),
                 postgres: None,
+                admin: None,
                 opendal_provider: "memory".to_string(),
                 opendal: HashMap::new(),
             }),

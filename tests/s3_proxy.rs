@@ -7,7 +7,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, CompletedPart, Delete, ObjectIdentifier, Owner};
 use aws_sdk_s3::Client;
 use s3_proxy::metadata::MetaDataBackend;
-use s3_proxy::{build_app, AppState, Config, SqliteConfig};
+use s3_proxy::{build_app, AdminConfig, AppState, Config, SqliteConfig};
 
 #[tokio::test]
 async fn test_it_runs_in_process() {
@@ -20,15 +20,14 @@ async fn test_it_runs_in_process() {
             url: "sqlite::memory:".to_string(),
         }),
         postgres: None,
+        admin: Some(AdminConfig {
+            access_key: "ANOTREAL".to_string(),
+            secret_key: "notrealrnrELgWzOk3IfjzDKtFBhDby".to_string(),
+        }),
         opendal_provider: "memory".to_string(),
         opendal: HashMap::new(),
     };
     let state = AppState::from_config(config).await.unwrap();
-    state
-        .metadata_store
-        .set_secret_key("ANOTREAL", "notrealrnrELgWzOk3IfjzDKtFBhDby")
-        .await
-        .unwrap();
     state
         .metadata_store
         .set_namespace_owner("ANOTREAL", "Testing", "1")

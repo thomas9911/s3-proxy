@@ -637,7 +637,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let operator = Operator::new(Memory::default()).unwrap();
         let config = Config {
             server_host: "127.0.0.1:0".to_string(),
             external_server_host: "http://127.0.0.1:0".to_string(),
@@ -647,6 +647,7 @@ mod tests {
                 url: "sqlite::memory:".to_string(),
             }),
             postgres: None,
+            admin: None,
             opendal_provider: "memory".to_string(),
             opendal: HashMap::new(),
         };
