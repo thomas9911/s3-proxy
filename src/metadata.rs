@@ -8,6 +8,14 @@ mod sql;
 pub use redis::RedisMetadataStore;
 pub use sql::{PostgresMetadataStore, SqliteMetadataStore};
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaDataBackend {
+    Redis,
+    Sqlite,
+    Postgres,
+}
+
 pub(crate) struct OperationTimer {
     operation: &'static str,
     started: Instant,

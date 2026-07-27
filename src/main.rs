@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing::Level;
+use metadata::MetaDataBackend;
 
 mod api;
 mod axum_ext;
@@ -21,6 +22,7 @@ mod retry;
 mod signature;
 mod templates;
 
+
 #[derive(Debug, serde::Deserialize)]
 pub struct Config {
     #[serde(default = "default_host")]
@@ -28,7 +30,7 @@ pub struct Config {
     #[serde(default = "default_external_host")]
     pub external_server_host: String,
     #[serde(default = "default_metadata_backend")]
-    pub metadata_backend: String,
+    pub metadata_backend: MetaDataBackend,
     pub redis: Option<deadpool_redis::Config>,
     pub sqlite: Option<SqliteConfig>,
     pub postgres: Option<PostgresConfig>,
@@ -54,8 +56,8 @@ fn default_external_host() -> String {
     String::from("http://0.0.0.0:3000")
 }
 
-fn default_metadata_backend() -> String {
-    String::from("redis")
+fn default_metadata_backend() -> MetaDataBackend {
+    MetaDataBackend::Redis
 }
 
 impl Config {
@@ -79,27 +81,26 @@ pub struct AppState {
 impl AppState {
     pub async fn from_config(config: Config) -> anyhow::Result<AppState> {
         let metadata_store: Arc<dyn metadata::MetadataStore> =
-            match config.metadata_backend.as_str() {
-                "redis" => {
+            match config.metadata_backend {
+                MetaDataBackend::Redis => {
                     let redis_config = config.redis.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("Redis metadata configuration is missing")
                     })?;
                     let pool = redis_config.create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
                     Arc::new(metadata::RedisMetadataStore::new(pool))
                 }
-                "sqlite" => {
+                MetaDataBackend::Sqlite => {
                     let sqlite_config = config.sqlite.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("SQLite metadata configuration is missing")
                     })?;
                     Arc::new(metadata::SqliteMetadataStore::connect(&sqlite_config.url).await?)
                 }
-                "postgres" => {
+                MetaDataBackend::Postgres => {
                     let postgres_config = config.postgres.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("PostgreSQL metadata configuration is missing")
                     })?;
                     Arc::new(metadata::PostgresMetadataStore::connect(&postgres_config.url).await?)
                 }
-                backend => anyhow::bail!("Unsupported metadata backend: {backend}"),
             };
         let operator = Operator::via_iter(&config.opendal_provider, config.opendal.clone())?
             .layer(opendal::layers::TracingLayer::new());

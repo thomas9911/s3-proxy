@@ -143,6 +143,7 @@ async fn list_objects_inner(
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
+    let bucket_prefix = format!("{}/{}/", namespace, bucket_name);
 
     if !opendal_operator
         .exists(&format!("{}/{}/", namespace, bucket_name))
@@ -156,7 +157,7 @@ async fn list_objects_inner(
     }
 
     let mut lister = opendal_operator
-        .lister_with(&format!("{}/{}/", namespace, bucket_name))
+        .lister_with(&bucket_prefix)
         .recursive(true)
         .await?;
 
@@ -184,7 +185,7 @@ async fn list_objects_inner(
                 if metadata.is_file() {
                     let key = entry
                         .path()
-                        .strip_prefix(&format!("{}/{}/", namespace, bucket_name))
+                        .strip_prefix(&bucket_prefix)
                         .unwrap_or(entry.path());
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
                     let last_modified =
