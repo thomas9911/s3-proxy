@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { SQL } from "bun";
+import { SQL, S3Client as BunS3Client } from "bun";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { Sha256 } from "@smithy/core/checksum";
@@ -148,6 +148,7 @@ async function signedDelete(body: string, contentMd5?: string) {
 		region,
 		service: "s3",
 		sha256: Sha256,
+		uriEscapePath: false,
 	});
 	const signed = await signer.sign(request);
 	return fetch(targetUrl, {
@@ -355,6 +356,17 @@ function client() {
 	});
 }
 
+async function presignedGetUrl(key: string) {
+	const signer = new BunS3Client({
+		accessKeyId,
+		secretAccessKey,
+		bucket,
+		endpoint,
+		region,
+	});
+	return signer.presign(key, { expiresIn: 604_800 });
+}
+
 let s3: S3Client;
 beforeAll(async () => {
 	await startTarget();
@@ -402,6 +414,9 @@ describe("S3 compatibility contract", () => {
 			new GetObjectCommand({ Bucket: bucket, Key: objectKey }),
 		);
 		expect(await object.Body?.transformToString()).toBe(objectBody);
+		const presignedResponse = await fetch(await presignedGetUrl(objectKey));
+		expect(presignedResponse.status).toBe(200);
+		expect(await presignedResponse.text()).toBe(objectBody);
 		const range = await s3.send(
 			new GetObjectCommand({ Bucket: bucket, Key: objectKey, Range: "bytes=0-4" }),
 		);
@@ -456,6 +471,50 @@ describe("S3 compatibility contract", () => {
 		expect(result.stdout).toContain("hello.txt");
 		const cat = await rclone(["cat", `regression:${bucket}/${objectKey}`]);
 		expect(cat.stdout).toBe(objectBody.trim());
+	});
+
+	test("supports rclone mkdir, move, and tree", async () => {
+		const sourceKey = "rclone-source.txt";
+		const movedKey = "rclone-directory/rclone-source.txt";
+		const sourcePath = `${process.cwd()}\\target\\rclone-move-${process.pid}.txt`;
+		await Bun.write(sourcePath, "rclone move regression\n");
+
+		try {
+			await rclone(["mkdir", `regression:${bucket}/rclone-directory`]);
+			await rclone([
+				"copyto",
+				sourcePath,
+				`regression:${bucket}/${sourceKey}`,
+			]);
+			await rclone([
+				"move",
+				`regression:${bucket}/${sourceKey}`,
+				`regression:${bucket}/rclone-directory/`,
+			]);
+
+			const tree = await rclone([
+				"tree",
+				`regression:${bucket}/rclone-directory`,
+			]);
+			expect(tree.stdout).toContain("rclone-source.txt");
+			await rclone(["deletefile", `regression:${bucket}/${movedKey}`]);
+			const treeAfterDelete = await rclone([
+				"tree",
+				`regression:${bucket}/rclone-directory`,
+			]);
+			expect(treeAfterDelete.stdout).not.toContain("rclone-source.txt");
+		} finally {
+			await rclone(["deletefile", `regression:${bucket}/${movedKey}`]).catch(
+				() => {},
+			);
+			await rclone(["deletefile", `regression:${bucket}/${sourceKey}`]).catch(
+				() => {},
+			);
+			await rclone(["rmdir", `regression:${bucket}/rclone-directory`]).catch(
+				() => {},
+			);
+			await unlink(sourcePath).catch(() => {});
+		}
 	});
 
 	test("supports multipart upload lifecycle", async () => {

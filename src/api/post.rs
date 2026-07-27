@@ -298,6 +298,7 @@ pub async fn complete_multipart(
     .await?;
     let metadata = ObjectMetadata {
         content_length: Some(content_length),
+        last_modified: Some(SystemTime::now()),
         ..Default::default()
     };
     crate::retry::retry("set_multipart_object_metadata", || {
@@ -699,6 +700,7 @@ pub async fn post_object(
             &ObjectMetadata {
                 content_type,
                 content_length: Some(content_length),
+                last_modified: Some(SystemTime::now()),
                 user_metadata,
                 ..Default::default()
             },

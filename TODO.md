@@ -11,6 +11,7 @@
 
 ## S3 API
 
+- [ ] Add an administrative API for creating access keys.
 - [x] Implement bucket policy storage and evaluation.
 - [x] Implement `PutBucketPolicy`, `GetBucketPolicy`, and `DeleteBucketPolicy`.
 - [x] Support policy actions for anonymous and access-key requests, including read, write, delete, and list.

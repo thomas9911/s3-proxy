@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod redis;
 mod sql;
@@ -43,6 +43,7 @@ pub struct ObjectMetadata {
     pub content_type: Option<String>,
     pub content_length: Option<u64>,
     pub etag: Option<String>,
+    pub last_modified: Option<SystemTime>,
     pub user_metadata: HashMap<String, String>,
 }
 
@@ -64,6 +65,11 @@ impl ObjectMetadata {
         if let Some(etag) = self.etag {
             metadata.insert("__etag".to_string(), etag);
         }
+        if let Some(last_modified) = self.last_modified {
+            if let Ok(seconds) = last_modified.duration_since(UNIX_EPOCH) {
+                metadata.insert("__last_modified".to_string(), seconds.as_secs().to_string());
+            }
+        }
         metadata
     }
 
@@ -74,6 +80,10 @@ impl ObjectMetadata {
                 .remove("__content_length")
                 .and_then(|value| value.parse().ok()),
             etag: metadata.remove("__etag"),
+            last_modified: metadata
+                .remove("__last_modified")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds)),
             user_metadata: metadata,
         }
     }

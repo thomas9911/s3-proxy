@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::SystemTime;
 
 pub async fn create_object(
     Path((bucket_name, object_name)): Path<(String, String)>,
@@ -76,27 +77,23 @@ pub async fn create_object(
             })
         })
         .collect();
-    let has_explicit_content_type = content_type
-        .as_deref()
-        .is_some_and(|value| value != "application/octet-stream");
-    if has_explicit_content_type || !user_metadata.is_empty() {
-        if let Err(error) = metadata_store
-            .set_object_metadata(
-                &namespace,
-                &bucket_name,
-                &object_name,
-                &ObjectMetadata {
-                    content_type,
-                    content_length: Some(content_length),
-                    user_metadata,
-                    ..Default::default()
-                },
-            )
-            .await
-        {
-            let _ = opendal_operator.delete(&filepath).await;
-            return Err(error.into());
-        }
+    if let Err(error) = metadata_store
+        .set_object_metadata(
+            &namespace,
+            &bucket_name,
+            &object_name,
+            &ObjectMetadata {
+                content_type,
+                content_length: Some(content_length),
+                last_modified: Some(SystemTime::now()),
+                user_metadata,
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        let _ = opendal_operator.delete(&filepath).await;
+        return Err(error.into());
     }
     if let Some(public) = public_acl(&header_map) {
         if let Err(error) = metadata_store
@@ -121,11 +118,12 @@ pub async fn put_object(
 ) -> Response {
     let headers = request.headers().clone();
     let has_authorization = headers.contains_key(AUTHORIZATION);
+    let has_presigned_query = crate::signature::has_presigned_query(request.uri());
     let (bucket_name, object_name) = path.0.clone();
     let part_number = query_value(request.uri().query(), "partNumber")
         .and_then(|value| value.parse::<u32>().ok());
     let upload_id = query_value(request.uri().query(), "uploadId");
-    let mut verified = if has_authorization {
+    let mut verified = if has_authorization || has_presigned_query {
         match VerifiedRequest::from_request(request, &state).await {
             Ok(verified) => verified,
             Err(error) => return error.into_response(),
@@ -370,12 +368,15 @@ pub async fn get_object(
     if let Some(etag) = metadata.etag().or(stored_metadata.etag.as_deref()) {
         response_headers.insert(ETAG, HeaderValue::from_str(etag)?);
     }
-    if let Some(last_modified) = metadata.last_modified() {
-        response_headers.insert(
-            LAST_MODIFIED,
-            HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
-        );
-    }
+    let last_modified = metadata
+        .last_modified()
+        .map(SystemTime::from)
+        .or(stored_metadata.last_modified)
+        .unwrap_or_else(SystemTime::now);
+    response_headers.insert(
+        LAST_MODIFIED,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+    );
     add_user_metadata(&mut response_headers, &stored_metadata).await?;
 
     let response_length = range
@@ -507,12 +508,15 @@ pub async fn head_object(
     if let Some(etag) = metadata.etag().or(stored_metadata.etag.as_deref()) {
         headers.insert(ETAG, HeaderValue::from_str(etag)?);
     }
-    if let Some(last_modified) = metadata.last_modified() {
-        headers.insert(
-            LAST_MODIFIED,
-            HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
-        );
-    }
+    let last_modified = metadata
+        .last_modified()
+        .map(SystemTime::from)
+        .or(stored_metadata.last_modified)
+        .unwrap_or_else(SystemTime::now);
+    headers.insert(
+        LAST_MODIFIED,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+    );
     add_user_metadata(&mut headers, &stored_metadata).await?;
     Ok((StatusCode::OK, headers).into_response())
 }
@@ -559,7 +563,9 @@ pub async fn delete_object_route(
     let headers = request.headers().clone();
     let (bucket_name, object_name) = path.0.clone();
     let upload_id = query_value(request.uri().query(), "uploadId");
-    let mut verified = if headers.contains_key(AUTHORIZATION) {
+    let mut verified = if headers.contains_key(AUTHORIZATION)
+        || crate::signature::has_presigned_query(request.uri())
+    {
         match VerifiedRequest::from_request(request, &state).await {
             Ok(verified) => verified,
             Err(error) => return error.into_response(),
@@ -883,7 +889,9 @@ async fn resolve_read_namespace(
     bucket_name: &str,
     object_name: &str,
 ) -> Result<String, Response<Body>> {
-    if request.headers().contains_key(AUTHORIZATION) {
+    if request.headers().contains_key(AUTHORIZATION)
+        || crate::signature::has_presigned_query(request.uri())
+    {
         let verified = VerifiedRequest::from_request(request, state)
             .await
             .map_err(IntoResponse::into_response)?;
