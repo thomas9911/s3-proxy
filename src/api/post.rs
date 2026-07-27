@@ -287,6 +287,14 @@ pub async fn complete_multipart(
         }
     }
     writer.close().await?;
+    crate::retry::retry("replace_multipart_object_metadata", || {
+        metadata_store.delete_object_metadata(&signature.namespace, &bucket_name, &object_name)
+    })
+    .await?;
+    crate::retry::retry("reset_multipart_object_public_acl", || {
+        metadata_store.set_object_public(&signature.namespace, &bucket_name, &object_name, false)
+    })
+    .await?;
     let metadata = ObjectMetadata {
         content_length: Some(content_length),
         ..Default::default()

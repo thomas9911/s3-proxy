@@ -252,6 +252,22 @@ async fn copy_object(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
+    if let Err(error) = crate::retry::retry("replace_copied_object_metadata", || {
+        metadata_store.delete_object_metadata(&namespace, &bucket_name, &object_name)
+    })
+    .await
+    {
+        tracing::error!(%error, "failed to replace copied object metadata");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if let Err(error) = crate::retry::retry("reset_copied_object_public_acl", || {
+        metadata_store.set_object_public(&namespace, &bucket_name, &object_name, false)
+    })
+    .await
+    {
+        tracing::error!(%error, "failed to reset copied object visibility");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     if let Ok(metadata) = metadata_store
         .object_metadata(&namespace, source_bucket, source_object)
         .await

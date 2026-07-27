@@ -421,6 +421,15 @@ describe("S3 compatibility contract", () => {
 		);
 		const copiedKey = "nested/copied.txt";
 		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: copiedKey,
+				Body: "old destination",
+				Metadata: { stale: "metadata" },
+				...(target === "proxy" ? { ACL: "public-read" as const } : {}),
+			}),
+		);
+		await s3.send(
 			new CopyObjectCommand({
 				Bucket: bucket,
 				Key: copiedKey,
@@ -431,6 +440,15 @@ describe("S3 compatibility contract", () => {
 			new GetObjectCommand({ Bucket: bucket, Key: copiedKey }),
 		);
 		expect(await copied.Body?.transformToString()).toBe(objectBody);
+		const copiedHead = await s3.send(
+			new HeadObjectCommand({ Bucket: bucket, Key: copiedKey }),
+		);
+		expect(copiedHead.Metadata?.stale).toBeUndefined();
+		expect(copiedHead.Metadata?.suite).toBe("regression");
+		if (target === "proxy") {
+			const copiedAnonymous = await fetch(`${endpoint}/${bucket}/${copiedKey}`);
+			expect(copiedAnonymous.status).toBe(403);
+		}
 	});
 
 	test("is usable by rclone", async () => {
@@ -442,6 +460,15 @@ describe("S3 compatibility contract", () => {
 
 	test("supports multipart upload lifecycle", async () => {
 		const key = "multipart/assembled.txt";
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: key,
+				Body: "old multipart destination",
+				Metadata: { stale: "metadata" },
+				...(target === "proxy" ? { ACL: "public-read" as const } : {}),
+			}),
+		);
 		const initiated = await s3.send(
 			new CreateMultipartUploadCommand({ Bucket: bucket, Key: key }),
 		);
@@ -521,6 +548,14 @@ describe("S3 compatibility contract", () => {
 		expect(await assembled.Body?.transformToString()).toBe(
 			firstPart + objectBody,
 		);
+		const multipartHead = await s3.send(
+			new HeadObjectCommand({ Bucket: bucket, Key: key }),
+		);
+		expect(multipartHead.Metadata?.stale).toBeUndefined();
+		if (target === "proxy") {
+			const multipartAnonymous = await fetch(`${endpoint}/${bucket}/${key}`);
+			expect(multipartAnonymous.status).toBe(403);
+		}
 		const aborted = await s3.send(
 			new CreateMultipartUploadCommand({ Bucket: bucket, Key: "multipart/aborted" }),
 		);
