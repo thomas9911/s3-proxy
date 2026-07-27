@@ -1,102 +1,124 @@
-use std::process::{Child, Command};
-use std::str::FromStr;
+use std::collections::HashMap;
 
 use aws_config::meta::region::RegionProviderChain;
+use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{Bucket, Owner};
+use aws_sdk_s3::types::{Bucket, CompletedPart, Delete, ObjectIdentifier, Owner};
 use aws_sdk_s3::Client;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-
-/// `setup()` is used to prepare the environment and spawn the child process for the test cases.
-async fn setup() -> anyhow::Result<Child> {
-    let access_key = "ANOTREAL";
-    let secret_key = "notrealrnrELgWzOk3IfjzDKtFBhDby";
-    let database_name = format!("s3-proxy-test-{}.db", std::process::id());
-    let database_url = format!("sqlite://target/{database_name}");
-    let options = SqliteConnectOptions::from_str(&database_url)?.create_if_missing(true);
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS access_keys (
-            access_key TEXT PRIMARY KEY,
-            secret_key TEXT NOT NULL
-        )",
-    )
-    .execute(&pool)
-    .await?;
-    sqlx::query(
-        "INSERT INTO access_keys (access_key, secret_key) VALUES (?, ?)
-         ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key",
-    )
-    .bind(access_key)
-    .bind(secret_key)
-    .execute(&pool)
-    .await?;
-    pool.close().await;
-
-    let path = assert_cmd::cargo::cargo_bin(env!("CARGO_PKG_NAME"));
-
-    let process = Command::new(path)
-        .env("S3_PROXY__METADATA_BACKEND", "sqlite")
-        .env("S3_PROXY__SQLITE__URL", &database_url)
-        .env("S3_PROXY__EXTERNAL_SERVER_HOST", "http://127.0.0.1:3000")
-        .env("S3_PROXY__OPENDAL_PROVIDER", "memory")
-        .env("S3_PROXY__OPENDAL__ROOT", "/tmp")
-        .spawn();
-
-    Ok(process?)
-}
+use s3_proxy::metadata::MetaDataBackend;
+use s3_proxy::{build_app, AppState, Config, SqliteConfig};
 
 #[tokio::test]
-async fn test_it_runs() {
-    let mut process = setup().await.unwrap();
+async fn test_it_runs_in_process() {
+    let config = Config {
+        server_host: "127.0.0.1:0".to_string(),
+        external_server_host: "http://127.0.0.1:0".to_string(),
+        metadata_backend: MetaDataBackend::Sqlite,
+        redis: None,
+        sqlite: Some(SqliteConfig {
+            url: "sqlite::memory:".to_string(),
+        }),
+        postgres: None,
+        opendal_provider: "memory".to_string(),
+        opendal: HashMap::new(),
+    };
+    let state = AppState::from_config(config).await.unwrap();
+    state
+        .metadata_store
+        .set_secret_key("ANOTREAL", "notrealrnrELgWzOk3IfjzDKtFBhDby")
+        .await
+        .unwrap();
+
+    let app = build_app(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
 
     let region_provider = RegionProviderChain::first_try(Region::new("us-west-2"));
-
     let shared_config = aws_config::from_env()
         .region(region_provider)
-        .test_credentials()
-        .endpoint_url("http://127.0.0.1:3000")
+        .credentials_provider(Credentials::new(
+            "ANOTREAL",
+            "notrealrnrELgWzOk3IfjzDKtFBhDby",
+            None,
+            None,
+            "test",
+        ))
+        .endpoint_url(format!("http://{address}"))
         .load()
         .await;
     let client = Client::new(&shared_config);
 
-    let create_bucket_req1 = client.create_bucket().bucket("testing");
-    let create_bucket_req2 = client.create_bucket().bucket("testing2");
-    let list_bucket_req = client.list_buckets();
+    client
+        .create_bucket()
+        .bucket("testing")
+        .send()
+        .await
+        .unwrap();
+    client
+        .create_bucket()
+        .bucket("testing2")
+        .send()
+        .await
+        .unwrap();
+    let bucket_policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::testing2"}]}"#;
+    client
+        .put_bucket_policy()
+        .bucket("testing2")
+        .policy(bucket_policy)
+        .send()
+        .await
+        .unwrap();
+    let stored_policy = client
+        .get_bucket_policy()
+        .bucket("testing2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stored_policy.policy(), Some(bucket_policy));
+    let list_bucket_res = client.list_buckets().send().await.unwrap();
 
-    let _ = create_bucket_req1.send().await;
-    let _ = create_bucket_req2.send().await;
-    let list_bucket_res = list_bucket_req.send().await;
-
-    let body = ByteStream::from_static(b"s3-proxy integration test");
     let put_object_res = client
         .put_object()
         .bucket("testing2")
         .key("Cargo.toml")
         .content_type("application/toml")
-        .body(body)
+        .body(ByteStream::from_static(b"s3-proxy integration test"))
         .send()
         .await;
-
-    let list_object_res = client.list_objects().bucket("testing2").send().await;
-
+    let list_object_res = client
+        .list_objects()
+        .bucket("testing2")
+        .send()
+        .await
+        .unwrap();
+    let delimited_list = client
+        .list_objects_v2()
+        .bucket("testing2")
+        .prefix("nested/")
+        .delimiter("/")
+        .send()
+        .await
+        .unwrap();
     let get_object_res = client
         .get_object()
         .bucket("testing2")
         .key("Cargo.toml")
         .send()
-        .await;
+        .await
+        .unwrap();
+    let head_object_res = client
+        .head_object()
+        .bucket("testing2")
+        .key("Cargo.toml")
+        .send()
+        .await
+        .unwrap();
 
-    process.kill().expect("command couldn't be killed");
-    process.wait().expect("command couldn't be waited on");
-    let _ = std::fs::remove_file(format!("target/s3-proxy-test-{}.db", std::process::id()));
-
-    let out = list_bucket_res.unwrap();
-
+    let out = list_bucket_res;
     let buckets = out.buckets();
     let expected_buckets = vec![
         Bucket::builder()
@@ -106,23 +128,119 @@ async fn test_it_runs() {
             .set_name(Some("testing2".to_string()))
             .build(),
     ];
-
-    let owner = out.owner();
-    let expected_owner = Owner::builder()
-        .set_display_name(Some("Testing".to_string()))
-        .set_id(Some("1".to_string()))
-        .build();
-
     assert_eq!(buckets, expected_buckets);
-    assert_eq!(owner, Some(&expected_owner));
+    assert_eq!(
+        out.owner(),
+        Some(
+            &Owner::builder()
+                .set_display_name(Some("Testing".to_string()))
+                .set_id(Some("1".to_string()))
+                .build()
+        )
+    );
     put_object_res.unwrap();
-
-    let _response = list_object_res.unwrap();
-    let response = get_object_res.unwrap();
-    let content_type = response.content_type();
-    let content_length = response.content_length();
-    assert_eq!(Some("application/toml"), content_type);
-    assert!(content_length.is_some());
-    let body = String::from_utf8(response.body.collect().await.unwrap().to_vec()).unwrap();
+    assert_eq!(list_object_res.contents().len(), 1);
+    assert!(delimited_list.contents().is_empty());
+    assert_eq!(head_object_res.content_type(), Some("application/toml"));
+    assert_eq!(get_object_res.content_type(), Some("application/toml"));
+    assert!(get_object_res.content_length().is_some());
+    let body = String::from_utf8(get_object_res.body.collect().await.unwrap().to_vec()).unwrap();
     assert!(body.contains("s3-proxy"));
+
+    client
+        .copy_object()
+        .bucket("testing2")
+        .key("copied.toml")
+        .copy_source("testing2/Cargo.toml")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_object()
+        .bucket("testing2")
+        .key("copied.toml")
+        .send()
+        .await
+        .unwrap();
+
+    let multipart = client
+        .create_multipart_upload()
+        .bucket("testing2")
+        .key("multipart.bin")
+        .send()
+        .await
+        .unwrap();
+    let upload_id = multipart.upload_id().unwrap();
+    let part = client
+        .upload_part()
+        .bucket("testing2")
+        .key("multipart.bin")
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"multipart"))
+        .send()
+        .await
+        .unwrap();
+    client
+        .complete_multipart_upload()
+        .bucket("testing2")
+        .key("multipart.bin")
+        .upload_id(upload_id)
+        .multipart_upload(
+            aws_sdk_s3::types::CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .part_number(1)
+                        .e_tag(part.e_tag().unwrap())
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_objects()
+        .bucket("testing2")
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("Cargo.toml")
+                        .build()
+                        .unwrap(),
+                )
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key("multipart.bin")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket_policy()
+        .bucket("testing2")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket()
+        .bucket("testing2")
+        .send()
+        .await
+        .unwrap();
+    client
+        .delete_bucket()
+        .bucket("testing")
+        .send()
+        .await
+        .unwrap();
+
+    server.abort();
+    let _ = server.await;
 }

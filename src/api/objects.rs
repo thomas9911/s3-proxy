@@ -619,7 +619,7 @@ pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_object, create_object, get_object, public_acl};
+    use super::{copy_object, create_object, get_object, public_acl, resolve_read_namespace};
     use crate::metadata::{MetadataStore, SqliteMetadataStore};
     use crate::signature::VerifiedRequest;
     use crate::{AppState, Config, SqliteConfig};
@@ -693,6 +693,47 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        metadata_store
+            .set_bucket_public("namespace", "bucket", true)
+            .await
+            .unwrap();
+        let public_bucket_namespace = resolve_read_namespace(
+            Request::builder()
+                .uri("/bucket/missing")
+                .body(Body::empty())
+                .unwrap(),
+            &state,
+            "bucket",
+            "missing",
+        )
+        .await
+        .unwrap();
+        assert_eq!(public_bucket_namespace, "namespace");
+        metadata_store
+            .set_bucket_public("namespace", "bucket", false)
+            .await
+            .unwrap();
+        metadata_store
+            .set_bucket_policy(
+                "policy-namespace",
+                "policy-bucket",
+                r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-bucket/*"}}"#,
+            )
+            .await
+            .unwrap();
+        let policy_namespace = resolve_read_namespace(
+            Request::builder()
+                .uri("/policy-bucket/object")
+                .body(Body::empty())
+                .unwrap(),
+            &state,
+            "policy-bucket",
+            "object",
+        )
+        .await
+        .unwrap();
+        assert_eq!(policy_namespace, "policy-namespace");
 
         let copied = copy_object(
             Path(("bucket".to_string(), "copied.txt".to_string())),
@@ -830,7 +871,7 @@ async fn authorize_policy_namespace(
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
         (name == key).then(|| value.to_string())
     })
 }

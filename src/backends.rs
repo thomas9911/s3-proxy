@@ -144,3 +144,48 @@ fn supports_partial_proxy(capability: &opendal::Capability) -> bool {
         && capability.delete
         && capability.list
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{probe, proxy_compatibility, supports_partial_proxy, supports_proxy};
+    use opendal::Capability;
+
+    #[test]
+    fn classifies_full_partial_and_unsupported_capabilities() {
+        let full = Capability {
+            stat: true,
+            read: true,
+            write: true,
+            write_can_empty: true,
+            write_with_content_type: true,
+            create_dir: true,
+            delete: true,
+            list: true,
+            list_with_recursive: true,
+            ..Default::default()
+        };
+        assert!(supports_proxy(&full));
+        assert!(supports_partial_proxy(&full));
+        assert_eq!(proxy_compatibility(&full), "full");
+
+        let partial = Capability {
+            stat: true,
+            read: true,
+            write: true,
+            write_can_empty: true,
+            create_dir: true,
+            delete: true,
+            list: true,
+            ..Default::default()
+        };
+        assert!(!supports_proxy(&partial));
+        assert!(supports_partial_proxy(&partial));
+        assert_eq!(proxy_compatibility(&partial), "partial");
+        assert_eq!(proxy_compatibility(&Capability::default()), "none");
+    }
+
+    #[test]
+    fn probes_configured_services_without_panicking() {
+        probe();
+    }
+}

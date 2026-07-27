@@ -453,7 +453,7 @@ struct MultipartManifest {
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
         (name == key).then(|| value.to_string())
     })
 }
@@ -955,18 +955,24 @@ fn policy_allows(
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_multipart, list_parts, multipart_manifest_path, multipart_prefix, policy_allows,
-        upload_part, MultipartManifest,
+        abort_multipart, calculate_signature, complete_multipart, delete_batch,
+        generate_signing_key, list_parts, multipart_manifest_path, multipart_prefix, policy_allows,
+        post_object, upload_part, MultipartManifest,
     };
     use crate::metadata::{MetadataStore, ObjectMetadata, SqliteMetadataStore};
     use crate::{AppState, Config, SqliteConfig};
+    use axum::body::Body;
     use axum::body::Bytes;
-    use axum::http::StatusCode;
+    use axum::extract::{FromRequest, State};
+    use axum::http::{Request, StatusCode};
+    use axum::response::Response;
+    use base64::Engine;
     use md5::{Digest, Md5};
     use opendal::services::Memory;
     use opendal::Operator;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use time::{Duration, OffsetDateTime};
 
     fn fields(key: &str) -> HashMap<String, String> {
         HashMap::from([(String::from("key"), key.to_string())])
@@ -1161,6 +1167,318 @@ mod tests {
                 .unwrap()
                 .to_vec(),
             b"multipart body"
+        );
+
+        operator
+            .write("namespace/bucket/delete-me.txt", b"delete me".to_vec())
+            .await
+            .unwrap();
+        let metadata_trait: Arc<dyn MetadataStore> = metadata_store.clone();
+        let (deleted, errors) = delete_batch(
+            &operator,
+            &metadata_trait,
+            "namespace",
+            "bucket",
+            vec![crate::templates::DeleteObjectIdentifier {
+                key: "delete-me.txt".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, vec!["delete-me.txt"]);
+        assert!(errors.is_empty());
+
+        let (abort_state, _, abort_operator) = test_state().await;
+        abort_operator
+            .create_dir("namespace/bucket/")
+            .await
+            .unwrap();
+        let abort_upload_id = "def456";
+        abort_operator
+            .create_dir(&format!("namespace/{}/", multipart_prefix(abort_upload_id)))
+            .await
+            .unwrap();
+        abort_operator
+            .write(
+                &multipart_manifest_path("namespace", abort_upload_id),
+                serde_json::to_vec(&MultipartManifest {
+                    bucket: "bucket".to_string(),
+                    object: "aborted.txt".to_string(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let abort_response = abort_multipart(
+            "bucket".to_string(),
+            abort_state,
+            crate::signature::VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: Bytes::new(),
+            },
+            abort_upload_id.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(abort_response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn presigned_post_handler_accepts_a_signed_upload() {
+        let (state, metadata_store, operator) = test_state().await;
+        let access_key = "access";
+        let secret_key = "secret";
+        metadata_store
+            .set_secret_key(access_key, secret_key)
+            .await
+            .unwrap();
+        operator.create_dir("access/bucket/").await.unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        let date_format = time::macros::format_description!("[year][month][day]");
+        let timestamp_format =
+            time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+        let date = now.format(date_format).unwrap();
+        let timestamp = now.format(timestamp_format).unwrap();
+        let credential = format!("{access_key}/{date}/us-east-1/s3/aws4_request");
+        let policy = serde_json::json!({
+            "expiration": (now + Duration::hours(1)).format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "conditions": [
+                { "bucket": "bucket" },
+                ["starts-with", "$key", "uploads/"],
+                ["content-length-range", 1, 100]
+            ]
+        });
+        let policy =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&policy).unwrap());
+        let signing_time = crate::signature::parse_date_time(&timestamp).unwrap();
+        let signature = calculate_signature(
+            generate_signing_key(secret_key, signing_time, "us-east-1", "s3"),
+            policy.as_bytes(),
+        );
+        let fields = [
+            ("key", "uploads/${filename}"),
+            ("x-amz-credential", credential.as_str()),
+            ("x-amz-date", timestamp.as_str()),
+            ("policy", policy.as_str()),
+            ("x-amz-signature", signature.as_str()),
+        ];
+        let boundary = "regression-boundary";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"posted.txt\"\r\nContent-Type: text/plain\r\n\r\nposted body\r\n--{boundary}--\r\n"
+            )
+            .as_bytes(),
+        );
+        let request = Request::builder()
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(request, &state)
+            .await
+            .unwrap();
+        let response = post_object(
+            axum::extract::Path("bucket".to_string()),
+            State(state),
+            multipart,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            operator
+                .read("access/bucket/uploads/posted.txt")
+                .await
+                .unwrap()
+                .to_vec(),
+            b"posted body"
+        );
+    }
+
+    async fn submit_post_form(
+        state: &AppState,
+        fields: HashMap<String, String>,
+        include_file: bool,
+    ) -> Response {
+        let boundary = "failure-boundary";
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        if include_file {
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"posted.txt\"\r\n\r\nposted body\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        let request = Request::builder()
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let multipart = axum::extract::Multipart::from_request(request, state)
+            .await
+            .unwrap();
+        post_object(
+            axum::extract::Path("bucket".to_string()),
+            State(state.clone()),
+            multipart,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn signed_post_fields(policy: &str, signature: Option<&str>) -> HashMap<String, String> {
+        let now = OffsetDateTime::now_utc();
+        let date_format = time::macros::format_description!("[year][month][day]");
+        let timestamp_format =
+            time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
+        let date = now.format(date_format).unwrap();
+        let timestamp = now.format(timestamp_format).unwrap();
+        let credential = format!("access/{date}/us-east-1/s3/aws4_request");
+        let encoded_policy = base64::engine::general_purpose::STANDARD.encode(policy.as_bytes());
+        let signing_time = crate::signature::parse_date_time(&timestamp).unwrap();
+        let calculated_signature = calculate_signature(
+            generate_signing_key("secret", signing_time, "us-east-1", "s3"),
+            encoded_policy.as_bytes(),
+        );
+        HashMap::from([
+            ("key".to_string(), "uploads/${filename}".to_string()),
+            ("x-amz-credential".to_string(), credential),
+            ("x-amz-date".to_string(), timestamp),
+            ("policy".to_string(), encoded_policy),
+            (
+                "x-amz-signature".to_string(),
+                signature.unwrap_or(&calculated_signature).to_string(),
+            ),
+        ])
+    }
+
+    #[tokio::test]
+    async fn presigned_post_handler_rejects_invalid_requests() {
+        let (state, metadata_store, operator) = test_state().await;
+        metadata_store
+            .set_secret_key("access", "secret")
+            .await
+            .unwrap();
+        operator.create_dir("access/bucket/").await.unwrap();
+
+        assert_eq!(
+            submit_post_form(&state, HashMap::new(), false)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let mut invalid_service = signed_post_fields("not json", None);
+        invalid_service.insert(
+            "x-amz-credential".to_string(),
+            "access/20260727/us-east-1/ec2/aws4_request".to_string(),
+        );
+        assert_eq!(
+            submit_post_form(&state, invalid_service, false)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+
+        let mut missing_policy = signed_post_fields("not json", None);
+        missing_policy.remove("policy");
+        assert_eq!(
+            submit_post_form(&state, missing_policy, false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut missing_signature = signed_post_fields("not json", None);
+        missing_signature.remove("x-amz-signature");
+        assert_eq!(
+            submit_post_form(&state, missing_signature, false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut invalid_date = signed_post_fields("not json", None);
+        invalid_date.insert("x-amz-date".to_string(), "invalid".to_string());
+        assert_eq!(
+            submit_post_form(&state, invalid_date, false).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields("not json", Some("wrong")), false,)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields("!!!", None), false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields("not json", None), false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let missing_expiration = r#"{"conditions":[]}"#;
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields(missing_expiration, None), false,)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let invalid_expiration = r#"{"expiration":"invalid","conditions":[]}"#;
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields(invalid_expiration, None), false,)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let expired = r#"{"expiration":"2020-01-01T00:00:00Z","conditions":[]}"#;
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields(expired, None), false)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        let failed_conditions = r#"{"expiration":"2099-01-01T00:00:00Z","conditions":[["starts-with","$key","private/"]]}"#;
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields(failed_conditions, None), true,)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let no_file = r#"{"expiration":"2099-01-01T00:00:00Z","conditions":[]}"#;
+        assert_eq!(
+            submit_post_form(&state, signed_post_fields(no_file, None), false)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

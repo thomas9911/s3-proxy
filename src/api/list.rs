@@ -134,6 +134,65 @@ pub async fn get_bucket(
         .map_or_else(IntoResponse::into_response, |response| response)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::get_bucket;
+    use crate::metadata::{MetaDataBackend, MetadataStore, SqliteMetadataStore};
+    use crate::{AppState, Config, SqliteConfig};
+    use axum::body::Body;
+    use axum::extract::{Path, State};
+    use axum::http::Request;
+    use opendal::services::Memory;
+    use opendal::Operator;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn lists_anonymous_public_bucket() {
+        let metadata_store = Arc::new(
+            SqliteMetadataStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        metadata_store
+            .set_bucket_public("namespace", "bucket", true)
+            .await
+            .unwrap();
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        operator.create_dir("namespace/bucket/").await.unwrap();
+        operator
+            .write("namespace/bucket/object.txt", b"object".to_vec())
+            .await
+            .unwrap();
+        let state = AppState {
+            metadata_store,
+            config: Arc::new(Config {
+                server_host: "127.0.0.1:0".to_string(),
+                external_server_host: "http://127.0.0.1:0".to_string(),
+                metadata_backend: MetaDataBackend::Sqlite,
+                redis: None,
+                sqlite: Some(SqliteConfig {
+                    url: "sqlite::memory:".to_string(),
+                }),
+                postgres: None,
+                opendal_provider: "memory".to_string(),
+                opendal: HashMap::new(),
+            }),
+            opendal_operator: operator,
+        };
+        let response = get_bucket(
+            Path("bucket".to_string()),
+            State(state),
+            Request::builder()
+                .uri("/bucket?list-type=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+}
+
 async fn list_objects_inner(
     bucket_name: String,
     query: HashMap<String, String>,
