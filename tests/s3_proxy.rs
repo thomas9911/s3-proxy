@@ -29,6 +29,11 @@ async fn test_it_runs_in_process() {
         .set_secret_key("ANOTREAL", "notrealrnrELgWzOk3IfjzDKtFBhDby")
         .await
         .unwrap();
+    state
+        .metadata_store
+        .set_namespace_owner("ANOTREAL", "Testing", "1")
+        .await
+        .unwrap();
 
     let app = build_app(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

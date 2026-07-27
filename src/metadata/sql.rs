@@ -1,4 +1,4 @@
-use super::{MetadataStore, ObjectMetadata};
+use super::{MetadataStore, NamespaceOwner, ObjectMetadata};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, AssertSqlSafe};
@@ -23,6 +23,15 @@ impl SqlMetadataStore {
             "CREATE TABLE IF NOT EXISTS access_keys (
                 access_key TEXT PRIMARY KEY,
                 secret_key TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS namespace_owners (
+                namespace TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                owner_id TEXT NOT NULL
             )",
         )
         .execute(&pool)
@@ -176,6 +185,19 @@ impl MetadataStore for SqliteMetadataStore {
             .bind(secret_key)
             .execute(&self.pool)
             .await?;
+        let owner_query = format!(
+            "INSERT INTO namespace_owners (namespace, display_name, owner_id)
+             VALUES ({}, {}, {}) ON CONFLICT(namespace) DO NOTHING",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        sqlx::query(AssertSqlSafe(owner_query))
+            .bind(access_key)
+            .bind(access_key)
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -187,6 +209,49 @@ impl MetadataStore for SqliteMetadataStore {
         .bind(access_key)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    async fn set_namespace_owner(
+        &self,
+        namespace: &str,
+        display_name: &str,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO namespace_owners (namespace, display_name, owner_id)
+             VALUES ({}, {}, {})
+             ON CONFLICT(namespace) DO UPDATE SET
+                 display_name = excluded.display_name,
+                 owner_id = excluded.owner_id",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(namespace)
+            .bind(display_name)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn namespace_owner(&self, namespace: &str) -> anyhow::Result<NamespaceOwner> {
+        let query = format!(
+            "SELECT display_name, owner_id FROM namespace_owners WHERE namespace = {}",
+            self.placeholder(1)
+        );
+        let owner = sqlx::query_as::<_, (String, String)>(AssertSqlSafe(query))
+            .bind(namespace)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(owner.map_or_else(
+            || NamespaceOwner {
+                display_name: namespace.to_string(),
+                id: namespace.to_string(),
+            },
+            |(display_name, id)| NamespaceOwner { display_name, id },
+        ))
     }
 
     async fn set_object_metadata(
@@ -455,6 +520,24 @@ mod tests {
         assert_eq!(
             store.secret_key("access").await.unwrap().as_deref(),
             Some("secret")
+        );
+        assert_eq!(
+            store.namespace_owner("access").await.unwrap(),
+            super::NamespaceOwner {
+                display_name: "access".to_string(),
+                id: "access".to_string(),
+            }
+        );
+        store
+            .set_namespace_owner("access", "Testing", "owner-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.namespace_owner("access").await.unwrap(),
+            super::NamespaceOwner {
+                display_name: "Testing".to_string(),
+                id: "owner-1".to_string(),
+            }
         );
 
         let metadata = ObjectMetadata {

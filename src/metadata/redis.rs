@@ -1,4 +1,4 @@
-use super::{MetadataStore, ObjectMetadata};
+use super::{MetadataStore, NamespaceOwner, ObjectMetadata};
 use async_trait::async_trait;
 use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
@@ -20,12 +20,53 @@ impl MetadataStore for RedisMetadataStore {
         let _: () = connection
             .set(format!("secret_key::{access_key}"), secret_key)
             .await?;
+        let owner_key = namespace_owner_key(access_key);
+        if !connection.exists(&owner_key).await? {
+            let _: () = connection
+                .hset_multiple(
+                    owner_key,
+                    &[("display_name", access_key), ("owner_id", access_key)],
+                )
+                .await?;
+        }
         Ok(())
     }
 
     async fn secret_key(&self, access_key: &str) -> anyhow::Result<Option<String>> {
         let mut connection = self.pool.get().await?;
         Ok(connection.get(format!("secret_key::{access_key}")).await?)
+    }
+
+    async fn set_namespace_owner(
+        &self,
+        namespace: &str,
+        display_name: &str,
+        id: &str,
+    ) -> anyhow::Result<()> {
+        let mut connection = self.pool.get().await?;
+        let _: () = connection
+            .hset_multiple(
+                namespace_owner_key(namespace),
+                &[("display_name", display_name), ("owner_id", id)],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn namespace_owner(&self, namespace: &str) -> anyhow::Result<NamespaceOwner> {
+        let mut connection = self.pool.get().await?;
+        let owner: std::collections::HashMap<String, String> =
+            connection.hgetall(namespace_owner_key(namespace)).await?;
+        Ok(NamespaceOwner {
+            display_name: owner
+                .get("display_name")
+                .cloned()
+                .unwrap_or_else(|| namespace.to_string()),
+            id: owner
+                .get("owner_id")
+                .cloned()
+                .unwrap_or_else(|| namespace.to_string()),
+        })
     }
 
     async fn set_object_metadata(
@@ -212,6 +253,10 @@ impl MetadataStore for RedisMetadataStore {
 
 fn object_metadata_key(namespace: &str, bucket: &str, object: &str) -> String {
     format!("object_metadata::{namespace}/{bucket}/{object}")
+}
+
+fn namespace_owner_key(namespace: &str) -> String {
+    format!("namespace_owner::{namespace}")
 }
 
 fn public_bucket_key(bucket: &str) -> String {

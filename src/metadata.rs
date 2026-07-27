@@ -46,6 +46,12 @@ pub struct ObjectMetadata {
     pub user_metadata: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NamespaceOwner {
+    pub display_name: String,
+    pub id: String,
+}
+
 impl ObjectMetadata {
     pub(crate) fn into_map(self) -> HashMap<String, String> {
         let mut metadata = self.user_metadata;
@@ -78,6 +84,15 @@ pub trait MetadataStore: Send + Sync {
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()>;
 
     async fn secret_key(&self, access_key: &str) -> anyhow::Result<Option<String>>;
+
+    async fn set_namespace_owner(
+        &self,
+        namespace: &str,
+        display_name: &str,
+        id: &str,
+    ) -> anyhow::Result<()>;
+
+    async fn namespace_owner(&self, namespace: &str) -> anyhow::Result<NamespaceOwner>;
 
     async fn set_object_metadata(
         &self,

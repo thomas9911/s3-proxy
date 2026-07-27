@@ -10,7 +10,9 @@ use tokio_stream::StreamExt;
 
 pub async fn list_buckets(
     State(AppState {
-        opendal_operator, ..
+        metadata_store,
+        opendal_operator,
+        ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
@@ -38,9 +40,10 @@ pub async fn list_buckets(
         }
     }
 
+    let owner = metadata_store.namespace_owner(namespace).await?;
     let template = templates::ListBucketsTemplate {
-        owner_name: "Testing",
-        owner_id: "1",
+        owner_name: &owner.display_name,
+        owner_id: &owner.id,
         buckets,
     };
 
