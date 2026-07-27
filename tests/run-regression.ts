@@ -59,6 +59,7 @@ run("proxy with Sled", {
 	S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
 	S3_TEST_METADATA_BACKEND: "sqlite",
 	S3_TEST_OPENDAL_PROVIDER: "sled",
+	S3_TEST_BATCH_SIZE: "50",
 });
 
 run("proxy with PostgreSQL metadata", {

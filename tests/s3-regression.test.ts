@@ -448,6 +448,19 @@ describe("S3 compatibility contract", () => {
 		expect(initiated.UploadId).toBeDefined();
 		const uploadId = initiated.UploadId ?? "";
 		const firstPart = "a".repeat(5 * 1024 * 1024);
+		await expectS3Error(
+			s3.send(
+				new UploadPartCommand({
+					Bucket: bucket,
+					Key: "multipart/different-key.txt",
+					UploadId: uploadId,
+					PartNumber: 1,
+					Body: "wrong upload",
+				}),
+			),
+			404,
+			["NoSuchUpload"],
+		);
 		const first = await s3.send(
 			new UploadPartCommand({
 				Bucket: bucket,
@@ -498,6 +511,19 @@ describe("S3 compatibility contract", () => {
 				Key: "multipart/aborted",
 				UploadId: aborted.UploadId,
 			}),
+		);
+		await expectS3Error(
+			s3.send(
+				new UploadPartCommand({
+					Bucket: bucket,
+					Key: "multipart/aborted",
+					UploadId: aborted.UploadId,
+					PartNumber: 1,
+					Body: "rejected",
+				}),
+			),
+			404,
+			["NoSuchUpload"],
 		);
 		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 	});

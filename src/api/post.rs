@@ -9,9 +9,9 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
 use base64::Engine;
-use futures_util::stream::StreamExt as FuturesStreamExt;
+use futures_util::stream::{StreamExt as FuturesStreamExt, TryStreamExt};
 use md5::{Digest, Md5};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -38,11 +38,11 @@ pub async fn post_bucket(
         return delete_objects(bucket_name, state, verified, content_md5).await;
     }
     if is_uploads {
-        let verified = match VerifiedRequest::from_request(request, &state).await {
-            Ok(verified) => verified,
-            Err(error) => return Ok(error.into_response()),
-        };
-        return initiate_multipart(bucket_name, None, State(state), verified).await;
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "A multipart upload must specify an object key.",
+        ));
     }
 
     let multipart = Multipart::from_request(request, &state).await?;
@@ -59,7 +59,7 @@ pub async fn post_object_route(
             Ok(verified) => verified,
             Err(error) => return error.into_response(),
         };
-        return initiate_multipart(bucket_name, Some(object_name), State(state), verified)
+        return initiate_multipart(bucket_name, object_name, State(state), verified)
             .await
             .map_or_else(IntoResponse::into_response, |response| response);
     }
@@ -81,7 +81,7 @@ pub async fn post_object_route(
 
 pub async fn initiate_multipart(
     bucket_name: String,
-    object_name: Option<String>,
+    object_name: String,
     State(AppState {
         opendal_operator, ..
     }): State<AppState>,
@@ -109,7 +109,16 @@ pub async fn initiate_multipart(
             multipart_prefix(&upload_id)
         ))
         .await?;
-    let object_name = object_name.unwrap_or_default();
+    let manifest = MultipartManifest {
+        bucket: bucket_name.clone(),
+        object: object_name.clone(),
+    };
+    opendal_operator
+        .write(
+            &multipart_manifest_path(&signature.namespace, &upload_id),
+            serde_json::to_vec(&manifest)?,
+        )
+        .await?;
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml")
@@ -121,7 +130,7 @@ pub async fn initiate_multipart(
 
 pub async fn upload_part(
     bucket_name: String,
-    _object_name: String,
+    object_name: String,
     state: AppState,
     signature: VerifiedRequest,
     upload_id: String,
@@ -143,6 +152,21 @@ pub async fn upload_part(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist.",
+        ));
+    }
+    if !manifest_matches(
+        &opendal_operator,
+        &signature.namespace,
+        &upload_id,
+        &bucket_name,
+        &object_name,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
         ));
     }
     let part_path = multipart_part_path(&signature.namespace, &upload_id, part_number);
@@ -180,6 +204,21 @@ pub async fn complete_multipart(
             "The specified bucket does not exist.",
         ));
     }
+    if !manifest_matches(
+        &opendal_operator,
+        &signature.namespace,
+        &upload_id,
+        &bucket_name,
+        &object_name,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
     let mut parts = request.parts;
     parts.sort_by_key(|part| part.part_number);
     if parts.is_empty()
@@ -193,27 +232,41 @@ pub async fn complete_multipart(
             "The multipart completion request is invalid.",
         ));
     }
-    let mut content = Vec::new();
+    let object_path = format!("{}/{}/{}", signature.namespace, bucket_name, object_name);
+    let mut writer = opendal_operator.writer(&object_path).await?;
+    let mut content_length = 0u64;
     for part in &parts {
         let path = multipart_part_path(&signature.namespace, &upload_id, part.part_number);
-        let bytes = match opendal_operator.read(&path).await {
-            Ok(bytes) => bytes,
+        let reader = match opendal_operator.reader(&path).await {
+            Ok(reader) => reader,
             Err(_) => {
+                let _ = writer.abort().await;
                 return Ok(s3_error_response(
                     StatusCode::BAD_REQUEST,
                     "InvalidPart",
                     "One or more parts are missing.",
-                ))
+                ));
             }
         };
-        content.extend_from_slice(&bytes.to_vec());
+        let mut stream = match reader.into_stream(..).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                let _ = writer.abort().await;
+                return Ok(s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPart",
+                    "One or more parts are missing.",
+                ));
+            }
+        };
+        while let Some(buffer) = stream.try_next().await? {
+            content_length += buffer.len() as u64;
+            writer.write(buffer).await?;
+        }
     }
-    let object_path = format!("{}/{}/{}", signature.namespace, bucket_name, object_name);
-    opendal_operator
-        .write(&object_path, content.clone())
-        .await?;
+    writer.close().await?;
     let metadata = ObjectMetadata {
-        content_length: Some(content.len() as u64),
+        content_length: Some(content_length),
         ..Default::default()
     };
     crate::retry::retry("set_multipart_object_metadata", || {
@@ -263,6 +316,21 @@ pub async fn abort_multipart(
             "The specified bucket does not exist.",
         ));
     }
+    if !manifest_matches(
+        &opendal_operator,
+        &signature.namespace,
+        &upload_id,
+        &bucket_name,
+        "",
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
     let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
     opendal_operator
         .delete_with(&prefix)
@@ -288,6 +356,21 @@ pub async fn list_parts(
     let AppState {
         opendal_operator, ..
     } = state;
+    if !manifest_matches(
+        &opendal_operator,
+        &signature.namespace,
+        &upload_id,
+        &bucket_name,
+        &object_name,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+        ));
+    }
     let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
     let mut lister = opendal_operator.lister_with(&prefix).await?;
     let mut parts = Vec::new();
@@ -331,6 +414,12 @@ struct CompletedPart {
     _etag: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct MultipartManifest {
+    bucket: String,
+    object: String,
+}
+
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
     query?.split('&').find_map(|part| {
         let (name, value) = part.split_once('=')?;
@@ -348,6 +437,26 @@ fn multipart_prefix(upload_id: &str) -> String {
 
 fn multipart_part_path(namespace: &str, upload_id: &str, part_number: u32) -> String {
     format!("{namespace}/{}/{part_number}", multipart_prefix(upload_id))
+}
+
+fn multipart_manifest_path(namespace: &str, upload_id: &str) -> String {
+    format!("{namespace}/{}/manifest.json", multipart_prefix(upload_id))
+}
+
+async fn manifest_matches(
+    operator: &opendal::Operator,
+    namespace: &str,
+    upload_id: &str,
+    bucket: &str,
+    object: &str,
+) -> anyhow::Result<bool> {
+    let path = multipart_manifest_path(namespace, upload_id);
+    if !operator.exists(&path).await? {
+        return Ok(false);
+    }
+    let manifest: MultipartManifest =
+        serde_json::from_slice(&operator.read(&path).await?.to_vec())?;
+    Ok(manifest.bucket == bucket && (object.is_empty() || manifest.object == object))
 }
 
 pub async fn post_object(
