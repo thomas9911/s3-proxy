@@ -617,6 +617,158 @@ pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
         })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{copy_object, create_object, get_object, public_acl};
+    use crate::metadata::{MetadataStore, SqliteMetadataStore};
+    use crate::signature::VerifiedRequest;
+    use crate::{AppState, Config, SqliteConfig};
+    use axum::body::{to_bytes, Body, Bytes};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+    use opendal::services::Memory;
+    use opendal::Operator;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    async fn test_state() -> (AppState, Arc<SqliteMetadataStore>, Operator) {
+        let metadata_store = Arc::new(
+            SqliteMetadataStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let config = Config {
+            server_host: "127.0.0.1:0".to_string(),
+            external_server_host: "http://127.0.0.1:0".to_string(),
+            metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            redis: None,
+            sqlite: Some(SqliteConfig {
+                url: "sqlite::memory:".to_string(),
+            }),
+            postgres: None,
+            opendal_provider: "memory".to_string(),
+            opendal: HashMap::new(),
+        };
+        (
+            AppState {
+                metadata_store: metadata_store.clone(),
+                config: Arc::new(config),
+                opendal_operator: operator.clone(),
+            },
+            metadata_store,
+            operator,
+        )
+    }
+
+    #[test]
+    fn parses_public_acl_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(public_acl(&headers), None);
+        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
+        assert_eq!(public_acl(&headers), Some(true));
+        headers.insert("x-amz-acl", HeaderValue::from_static("private"));
+        assert_eq!(public_acl(&headers), Some(false));
+    }
+
+    #[tokio::test]
+    async fn object_handlers_cover_overwrite_copy_and_range_read() {
+        let (state, metadata_store, operator) = test_state().await;
+        operator.create_dir("namespace/bucket/").await.unwrap();
+        let original = Bytes::from_static(b"original body");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("x-amz-meta-old", HeaderValue::from_static("value"));
+        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
+        let response = create_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            headers,
+            State(state.clone()),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: original.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let copied = copy_object(
+            Path(("bucket".to_string(), "copied.txt".to_string())),
+            HeaderMap::new(),
+            state.clone(),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: Bytes::new(),
+            },
+            &HeaderValue::from_static("bucket/source.txt"),
+        )
+        .await;
+        assert_eq!(copied.status(), StatusCode::OK);
+
+        let copied_metadata = metadata_store
+            .object_metadata("namespace", "bucket", "copied.txt")
+            .await
+            .unwrap();
+        assert_eq!(copied_metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            metadata_store
+                .public_object_namespace("bucket", "copied.txt")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let range_request = Request::builder()
+            .uri("/bucket/source.txt")
+            .header("range", "bytes=0-7")
+            .body(Body::empty())
+            .unwrap();
+        let range_response = get_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            State(state.clone()),
+            range_request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(range_response.into_body(), 1024).await.unwrap(),
+            Bytes::from_static(b"original")
+        );
+
+        let mut overwrite_headers = HeaderMap::new();
+        overwrite_headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        let replacement = Bytes::from_static(b"replacement");
+        create_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            overwrite_headers,
+            State(state),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: replacement,
+            },
+        )
+        .await
+        .unwrap();
+        let metadata = metadata_store
+            .object_metadata("namespace", "bucket", "source.txt")
+            .await
+            .unwrap();
+        assert!(metadata.user_metadata.is_empty());
+        assert_eq!(
+            metadata_store
+                .public_object_namespace("bucket", "source.txt")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+}
+
 async fn resolve_policy_namespace(
     state: &AppState,
     bucket_name: &str,

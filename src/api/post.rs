@@ -954,8 +954,19 @@ fn policy_allows(
 
 #[cfg(test)]
 mod tests {
-    use super::policy_allows;
+    use super::{
+        complete_multipart, list_parts, multipart_manifest_path, multipart_prefix, policy_allows,
+        upload_part, MultipartManifest,
+    };
+    use crate::metadata::{MetadataStore, ObjectMetadata, SqliteMetadataStore};
+    use crate::{AppState, Config, SqliteConfig};
+    use axum::body::Bytes;
+    use axum::http::StatusCode;
+    use md5::{Digest, Md5};
+    use opendal::services::Memory;
+    use opendal::Operator;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn fields(key: &str) -> HashMap<String, String> {
         HashMap::from([(String::from("key"), key.to_string())])
@@ -1010,5 +1021,146 @@ mod tests {
             "bucket",
             1
         ));
+    }
+
+    async fn test_state() -> (AppState, Arc<SqliteMetadataStore>, Operator) {
+        let metadata_store = Arc::new(
+            SqliteMetadataStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let operator = Operator::new(Memory::default()).unwrap().finish();
+        let config = Config {
+            server_host: "127.0.0.1:0".to_string(),
+            external_server_host: "http://127.0.0.1:0".to_string(),
+            metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            redis: None,
+            sqlite: Some(SqliteConfig {
+                url: "sqlite::memory:".to_string(),
+            }),
+            postgres: None,
+            opendal_provider: "memory".to_string(),
+            opendal: HashMap::new(),
+        };
+        (
+            AppState {
+                metadata_store: metadata_store.clone(),
+                config: Arc::new(config),
+                opendal_operator: operator.clone(),
+            },
+            metadata_store,
+            operator,
+        )
+    }
+
+    #[tokio::test]
+    async fn multipart_handlers_store_and_complete_parts() {
+        let (state, metadata_store, operator) = test_state().await;
+        operator.create_dir("namespace/bucket/").await.unwrap();
+        metadata_store
+            .set_object_metadata(
+                "namespace",
+                "bucket",
+                "object.txt",
+                &ObjectMetadata {
+                    user_metadata: HashMap::from([(String::from("stale"), String::from("yes"))]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        metadata_store
+            .set_object_public("namespace", "bucket", "object.txt", true)
+            .await
+            .unwrap();
+
+        let upload_id = "abc123";
+        operator
+            .create_dir(&format!("namespace/{}/", multipart_prefix(upload_id)))
+            .await
+            .unwrap();
+        operator
+            .write(
+                &multipart_manifest_path("namespace", upload_id),
+                serde_json::to_vec(&MultipartManifest {
+                    bucket: "bucket".to_string(),
+                    object: "object.txt".to_string(),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let part = Bytes::from_static(b"multipart body");
+        let etag = format!("{:x}", Md5::digest(&part));
+        let upload_response = upload_part(
+            "bucket".to_string(),
+            "object.txt".to_string(),
+            state.clone(),
+            crate::signature::VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: part,
+            },
+            upload_id.to_string(),
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(upload_response.status(), StatusCode::OK);
+
+        let list_response = list_parts(
+            "bucket".to_string(),
+            "object.txt".to_string(),
+            state.clone(),
+            crate::signature::VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: Bytes::new(),
+            },
+            upload_id.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list_response.status(), StatusCode::OK);
+
+        let complete_response = complete_multipart(
+            "bucket".to_string(),
+            "object.txt".to_string(),
+            state,
+            crate::signature::VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: Bytes::from(format!(
+                    "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{etag}\"</ETag></Part></CompleteMultipartUpload>"
+                )),
+            },
+            upload_id.to_string(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(complete_response.status(), StatusCode::OK);
+
+        let stored = metadata_store
+            .object_metadata("namespace", "bucket", "object.txt")
+            .await
+            .unwrap();
+        assert!(stored.user_metadata.is_empty());
+        assert_eq!(stored.content_length, Some(14));
+        assert_eq!(
+            metadata_store
+                .public_object_namespace("bucket", "object.txt")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            operator
+                .read("namespace/bucket/object.txt")
+                .await
+                .unwrap()
+                .to_vec(),
+            b"multipart body"
+        );
     }
 }
