@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{metadata::ObjectMetadata, AppState};
+use crate::{metadata::ObjectMetadata, templates, AppState};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::header::{
@@ -289,13 +289,7 @@ async fn copy_object(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(Body::from(
-            "<CopyObjectResult><ETag></ETag></CopyObjectResult>",
-        ))
-        .expect("static copy response headers are valid")
+    templates::xml_response(StatusCode::OK, templates::CopyObjectTemplate)
 }
 
 pub async fn get_object(
@@ -449,13 +443,16 @@ fn parse_range(value: &HeaderValue, length: u64) -> Result<std::ops::Range<u64>,
 }
 
 fn range_not_satisfiable(length: u64) -> Response {
-    Response::builder()
-        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-        .header("content-range", format!("bytes */{length}"))
-        .body(Body::from(
-            "<Error><Code>InvalidRange</Code><Message>The requested range is not satisfiable.</Message></Error>",
-        ))
-        .expect("static range error response headers are valid")
+    let mut response = templates::xml_response(
+        StatusCode::RANGE_NOT_SATISFIABLE,
+        templates::InvalidRangeTemplate,
+    );
+    response.headers_mut().insert(
+        "content-range",
+        HeaderValue::from_str(&format!("bytes */{length}"))
+            .expect("content range generated from a u64 is valid"),
+    );
+    response
 }
 
 pub async fn head_object(

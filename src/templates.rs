@@ -1,7 +1,64 @@
 use askama::Template;
 use askama_web::WebTemplate;
+use axum::body::Body;
+use axum::http::{Response, StatusCode};
 use serde::Deserialize;
 use std::borrow::Cow;
+
+pub(crate) fn xml_response<T: Template>(status: StatusCode, template: T) -> Response<Body> {
+    let body = template.render().expect("XML template rendering failed");
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
+        .expect("static XML response headers are valid")
+}
+
+#[derive(Debug, Template)]
+#[template(path = "error.xml")]
+pub struct ErrorTemplate<'a> {
+    pub code: &'a str,
+    pub message: &'a str,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "initiate_multipart.xml")]
+pub struct InitiateMultipartTemplate<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "complete_multipart.xml")]
+pub struct CompleteMultipartTemplate<'a> {
+    pub location: &'a str,
+    pub bucket: &'a str,
+    pub key: &'a str,
+}
+
+#[derive(Debug)]
+pub struct ListPartItem {
+    pub part_number: u32,
+    pub size: u64,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "list_parts.xml")]
+pub struct ListPartsTemplate<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub upload_id: &'a str,
+    pub parts: &'a [ListPartItem],
+}
+
+#[derive(Debug, Template)]
+#[template(path = "copy_object.xml")]
+pub struct CopyObjectTemplate;
+
+#[derive(Debug, Template)]
+#[template(path = "invalid_range.xml")]
+pub struct InvalidRangeTemplate;
 
 #[derive(Debug)]
 pub struct ListBucketItem<'a> {

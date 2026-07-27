@@ -1,3 +1,4 @@
+use crate::templates;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, PercentEncodingMode, SessionTokenMode, SignableBody, SignableRequest,
@@ -40,16 +41,7 @@ pub struct VerifiedRequest {
 }
 
 pub(crate) fn s3_error_response(status: StatusCode, code: &str, message: &str) -> Response<Body> {
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Error><Code>{code}</Code><Message>{message}</Message></Error>"#
-    );
-
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/xml")
-        .body(Body::from(body))
-        .expect("static S3 error response headers are valid")
+    templates::xml_response(status, templates::ErrorTemplate { code, message })
 }
 
 pub enum VerifiedRequestError {

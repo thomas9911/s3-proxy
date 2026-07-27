@@ -120,13 +120,14 @@ pub async fn initiate_multipart(
             serde_json::to_vec(&manifest)?,
         )
         .await?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(Body::from(format!(
-            "<InitiateMultipartUploadResult><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
-        )))
-        .expect("static multipart response headers are valid"))
+    Ok(templates::xml_response(
+        StatusCode::OK,
+        templates::InitiateMultipartTemplate {
+            bucket: &bucket_name,
+            key: &object_name,
+            upload_id: &upload_id,
+        },
+    ))
 }
 
 pub async fn upload_part(
@@ -313,13 +314,15 @@ pub async fn complete_multipart(
         .delete_with(&prefix)
         .recursive(true)
         .await?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(Body::from(format!(
-            "<CompleteMultipartUploadResult><Location>/{bucket_name}/{object_name}</Location><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><ETag></ETag></CompleteMultipartUploadResult>"
-        )))
-        .expect("static multipart response headers are valid"))
+    let location = format!("/{bucket_name}/{object_name}");
+    Ok(templates::xml_response(
+        StatusCode::OK,
+        templates::CompleteMultipartTemplate {
+            location: &location,
+            bucket: &bucket_name,
+            key: &object_name,
+        },
+    ))
 }
 
 pub async fn abort_multipart(
@@ -413,21 +416,19 @@ pub async fn list_parts(
         }
     }
     parts.sort_by_key(|(part_number, _)| *part_number);
-    let entries = parts
+    let parts = parts
         .into_iter()
-        .map(|(part_number, size)| {
-            format!(
-                "<Part><PartNumber>{part_number}</PartNumber><LastModified>1970-01-01T00:00:00Z</LastModified><ETag></ETag><Size>{size}</Size></Part>"
-            )
-        })
-        .collect::<String>();
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/xml")
-        .body(Body::from(format!(
-            "<ListPartsResult><Bucket>{bucket_name}</Bucket><Key>{object_name}</Key><UploadId>{upload_id}</UploadId>{entries}</ListPartsResult>"
-        )))
-        .expect("static multipart response headers are valid"))
+        .map(|(part_number, size)| templates::ListPartItem { part_number, size })
+        .collect::<Vec<_>>();
+    Ok(templates::xml_response(
+        StatusCode::OK,
+        templates::ListPartsTemplate {
+            bucket: &bucket_name,
+            key: &object_name,
+            upload_id: &upload_id,
+            parts: &parts,
+        },
+    ))
 }
 
 #[derive(Debug, Deserialize)]

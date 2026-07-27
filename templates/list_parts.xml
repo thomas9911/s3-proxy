@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult><Bucket>{{ bucket }}</Bucket><Key>{{ key }}</Key><UploadId>{{ upload_id }}</UploadId>
+{%- for part in parts %}<Part><PartNumber>{{ part.part_number }}</PartNumber><LastModified>1970-01-01T00:00:00Z</LastModified><ETag></ETag><Size>{{ part.size }}</Size></Part>
+{%- endfor %}</ListPartsResult>
