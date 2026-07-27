@@ -479,10 +479,29 @@ describe("S3 compatibility contract", () => {
 				Body: objectBody,
 			}),
 		);
+		expect(first.ETag).toBeDefined();
+		expect(second.ETag).toBeDefined();
 		const listedParts = await s3.send(
 			new ListPartsCommand({ Bucket: bucket, Key: key, UploadId: uploadId }),
 		);
 		expect(listedParts.Parts?.map((part) => part.PartNumber)).toEqual([1, 2]);
+		await expectS3Error(
+			s3.send(
+				new CompleteMultipartUploadCommand({
+					Bucket: bucket,
+					Key: key,
+					UploadId: uploadId,
+					MultipartUpload: {
+						Parts: [
+							{ ETag: '"wrong"', PartNumber: 1 },
+							{ ETag: second.ETag, PartNumber: 2 },
+						],
+					},
+				}),
+			),
+			400,
+			["InvalidPart"],
+		);
 		await s3.send(
 			new CompleteMultipartUploadCommand({
 				Bucket: bucket,
@@ -550,6 +569,41 @@ describe("S3 compatibility contract", () => {
 		const publicResponse = await fetch(`${endpoint}/${bucket}/${publicObjectKey}`);
 		expect(publicResponse.status).toBe(200);
 		expect(await publicResponse.text()).toBe(objectBody);
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: publicObjectKey,
+				Body: "private replacement",
+			}),
+		);
+		const overwrittenPublicResponse = await fetch(
+			`${endpoint}/${bucket}/${publicObjectKey}`,
+		);
+		expect(overwrittenPublicResponse.status).toBe(403);
+
+		const bulkPublicKey = "public/bulk-delete.txt";
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: bucket,
+				Key: bulkPublicKey,
+				Body: objectBody,
+				ACL: "public-read",
+			}),
+		);
+		await s3.send(
+			new DeleteObjectsCommand({
+				Bucket: bucket,
+				Delete: { Objects: [{ Key: bulkPublicKey }] },
+			}),
+		);
+		await s3.send(
+			new PutObjectCommand({ Bucket: bucket, Key: bulkPublicKey, Body: objectBody }),
+		);
+		const recreatedBulkResponse = await fetch(
+			`${endpoint}/${bucket}/${bulkPublicKey}`,
+		);
+		expect(recreatedBulkResponse.status).toBe(403);
+		await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: bulkPublicKey }));
 		const privateResponse = await fetch(
 			`${endpoint}/${bucket}/${privateObjectKey}`,
 		);
@@ -658,6 +712,45 @@ describe("S3 compatibility contract", () => {
 		await s3.send(
 			new DeleteObjectCommand({ Bucket: bucket, Key: policyObjectKey }),
 		);
+		const deletedPolicyBucket = `${bucket}-policy-delete`;
+		const deletedPolicyKey = "object.txt";
+		await s3.send(new CreateBucketCommand({ Bucket: deletedPolicyBucket }));
+		await s3.send(
+			new PutBucketPolicyCommand({
+				Bucket: deletedPolicyBucket,
+				Policy: JSON.stringify({
+					Version: "2012-10-17",
+					Statement: [{
+						Effect: "Allow",
+						Principal: "*",
+						Action: "s3:GetObject",
+						Resource: `arn:aws:s3:::${deletedPolicyBucket}/*`,
+					}],
+				}),
+			}),
+		);
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: deletedPolicyBucket,
+				Key: deletedPolicyKey,
+				Body: objectBody,
+			}),
+		);
+		await s3.send(new DeleteBucketCommand({ Bucket: deletedPolicyBucket }));
+		await s3.send(new CreateBucketCommand({ Bucket: deletedPolicyBucket }));
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: deletedPolicyBucket,
+				Key: deletedPolicyKey,
+				Body: objectBody,
+			}),
+		);
+		const recreatedPolicyResponse = await fetch(
+			`${endpoint}/${deletedPolicyBucket}/${deletedPolicyKey}`,
+		);
+		expect(recreatedPolicyResponse.status).toBe(403);
+		await s3.send(new DeleteObjectCommand({ Bucket: deletedPolicyBucket, Key: deletedPolicyKey }));
+		await s3.send(new DeleteBucketCommand({ Bucket: deletedPolicyBucket }));
 	});
 
 	test("lists 2000 objects through paginated responses", async () => {

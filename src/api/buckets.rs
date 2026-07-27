@@ -205,5 +205,8 @@ async fn delete_bucket_inner(
     metadata_store
         .delete_public_bucket(&namespace, &bucket_name)
         .await?;
+    metadata_store
+        .delete_bucket_policy(&namespace, &bucket_name)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -48,6 +48,23 @@ pub async fn create_object(
 
     writer.await?;
 
+    if let Err(error) = crate::retry::retry("replace_object_metadata", || {
+        metadata_store.delete_object_metadata(&namespace, &bucket_name, &object_name)
+    })
+    .await
+    {
+        let _ = opendal_operator.delete(&filepath).await;
+        return Err(error.into());
+    }
+    if let Err(error) = crate::retry::retry("reset_object_public_acl", || {
+        metadata_store.set_object_public(&namespace, &bucket_name, &object_name, false)
+    })
+    .await
+    {
+        let _ = opendal_operator.delete(&filepath).await;
+        return Err(error.into());
+    }
+
     let user_metadata: HashMap<String, String> = header_map
         .iter()
         .filter_map(|(name, value)| {

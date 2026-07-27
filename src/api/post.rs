@@ -14,6 +14,7 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 const CONTENT_MD5: HeaderName = HeaderName::from_static("content-md5");
 
@@ -170,8 +171,13 @@ pub async fn upload_part(
         ));
     }
     let part_path = multipart_part_path(&signature.namespace, &upload_id, part_number);
+    let etag = format!("{:x}", Md5::digest(&signature.bytes));
     opendal_operator.write(&part_path, signature.bytes).await?;
-    Ok(StatusCode::OK.into_response())
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("etag", format!("\"{etag}\""))
+        .body(Body::empty())
+        .expect("static upload part response headers are valid"))
 }
 
 pub async fn complete_multipart(
@@ -225,6 +231,9 @@ pub async fn complete_multipart(
         || parts
             .iter()
             .any(|part| !(1..=10_000).contains(&part.part_number))
+        || parts
+            .windows(2)
+            .any(|parts| parts[0].part_number == parts[1].part_number)
     {
         return Ok(s3_error_response(
             StatusCode::BAD_REQUEST,
@@ -259,9 +268,22 @@ pub async fn complete_multipart(
                 ));
             }
         };
+        let mut digest = Md5::new();
         while let Some(buffer) = stream.try_next().await? {
-            content_length += buffer.len() as u64;
+            let bytes = buffer.to_vec();
+            digest.update(&bytes);
+            content_length += bytes.len() as u64;
             writer.write(buffer).await?;
+        }
+        let actual_etag = format!("{:x}", digest.finalize());
+        let expected_etag = part.etag.trim_matches('"');
+        if expected_etag.is_empty() || expected_etag != actual_etag {
+            let _ = writer.abort().await;
+            return Ok(s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPart",
+                "The part ETag does not match the uploaded part.",
+            ));
         }
     }
     writer.close().await?;
@@ -411,7 +433,7 @@ struct CompletedPart {
     #[serde(rename = "PartNumber")]
     part_number: u32,
     #[serde(rename = "ETag", default)]
-    _etag: String,
+    etag: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -589,9 +611,37 @@ pub async fn post_object(
             ))
         }
     };
+    let Some(expiration) = policy.get("expiration").and_then(serde_json::Value::as_str) else {
+        return Ok(s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "InvalidPolicyDocument",
+            "The policy expiration is missing.",
+        ));
+    };
+    let expiration = match OffsetDateTime::parse(expiration, &Rfc3339) {
+        Ok(expiration) => expiration,
+        Err(_) => {
+            return Ok(s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidPolicyDocument",
+                "The policy expiration is invalid.",
+            ))
+        }
+    };
+    if expiration <= OffsetDateTime::now_utc() {
+        return Ok(s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "The presigned POST policy has expired.",
+        ));
+    }
+    let key_template = fields.get("key").cloned().unwrap_or_default();
+    let key = key_template.replace("${filename}", filename.as_deref().unwrap_or_default());
+    let mut validation_fields = fields.clone();
+    validation_fields.insert("key".to_string(), key.clone());
     if !policy_allows(
         &policy,
-        &fields,
+        &validation_fields,
         &bucket_name,
         file.as_ref().map(|body| body.len()).unwrap_or(0),
     ) {
@@ -602,8 +652,6 @@ pub async fn post_object(
         ));
     }
 
-    let key_template = fields.get("key").cloned().unwrap_or_default();
-    let key = key_template.replace("${filename}", filename.as_deref().unwrap_or_default());
     let Some(file) = file else {
         return Ok(s3_error_response(
             StatusCode::BAD_REQUEST,
@@ -619,6 +667,14 @@ pub async fn post_object(
         writer = writer.content_type(content_type);
     }
     writer.await?;
+    crate::retry::retry("replace_presigned_post_metadata", || {
+        metadata_store.delete_object_metadata(access_key, &bucket_name, &key)
+    })
+    .await?;
+    crate::retry::retry("reset_presigned_post_public_acl", || {
+        metadata_store.set_object_public(access_key, &bucket_name, &key, false)
+    })
+    .await?;
     let user_metadata = fields
         .iter()
         .filter_map(|(name, value)| {
@@ -790,6 +846,13 @@ async fn delete_batch(
     })
     .await
     .map_err(|error| delete_error(String::new(), error))?;
+    for object in &object_names {
+        crate::retry::retry("delete_object_public_acl", || {
+            metadata_store.set_object_public(namespace, bucket_name, object, false)
+        })
+        .await
+        .map_err(|error| delete_error((*object).to_string(), error))?;
+    }
     Ok((deleted, errors))
 }
 
@@ -817,29 +880,126 @@ fn policy_allows(
         if let Some(object) = condition.as_object() {
             for (key, value) in object {
                 let field = key.to_ascii_lowercase();
-                let expected = value.as_str().unwrap_or_default();
-                if field == "bucket" && expected != bucket {
+                let Some(expected) = value.as_str() else {
                     return false;
-                }
-                if field != "bucket" && fields.get(&field).map(String::as_str) != Some(expected) {
+                };
+                if field == "bucket" {
+                    if expected != bucket {
+                        return false;
+                    }
+                } else if fields.get(&field).map(String::as_str) != Some(expected) {
                     return false;
                 }
             }
         } else if let Some(array) = condition.as_array() {
-            if array.first().and_then(serde_json::Value::as_str) == Some("content-length-range") {
-                let min = array
-                    .get(1)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                let max = array
-                    .get(2)
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as usize;
-                if size < min || size > max {
-                    return false;
+            let Some(operator) = array.first().and_then(serde_json::Value::as_str) else {
+                return false;
+            };
+            match operator {
+                "content-length-range" => {
+                    let Some(min) = array.get(1).and_then(serde_json::Value::as_u64) else {
+                        return false;
+                    };
+                    let Some(max) = array.get(2).and_then(serde_json::Value::as_u64) else {
+                        return false;
+                    };
+                    if size < min as usize || size > max as usize {
+                        return false;
+                    }
                 }
+                "starts-with" => {
+                    let Some(field) = array.get(1).and_then(serde_json::Value::as_str) else {
+                        return false;
+                    };
+                    let Some(prefix) = array.get(2).and_then(serde_json::Value::as_str) else {
+                        return false;
+                    };
+                    let field = field.trim_start_matches('$').to_ascii_lowercase();
+                    let Some(actual) = fields.get(&field) else {
+                        return false;
+                    };
+                    if !actual.starts_with(prefix) {
+                        return false;
+                    }
+                }
+                "eq" => {
+                    let Some(field) = array.get(1).and_then(serde_json::Value::as_str) else {
+                        return false;
+                    };
+                    let Some(expected) = array.get(2).and_then(serde_json::Value::as_str) else {
+                        return false;
+                    };
+                    let field = field.trim_start_matches('$').to_ascii_lowercase();
+                    if fields.get(&field).map(String::as_str) != Some(expected) {
+                        return false;
+                    }
+                }
+                _ => return false,
             }
+        } else {
+            return false;
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::policy_allows;
+    use std::collections::HashMap;
+
+    fn fields(key: &str) -> HashMap<String, String> {
+        HashMap::from([(String::from("key"), key.to_string())])
+    }
+
+    #[test]
+    fn enforces_starts_with_conditions() {
+        let policy = serde_json::json!({
+            "conditions": [["starts-with", "$key", "uploads/"]]
+        });
+        assert!(policy_allows(
+            &policy,
+            &fields("uploads/file.txt"),
+            "bucket",
+            1
+        ));
+        assert!(!policy_allows(
+            &policy,
+            &fields("private/file.txt"),
+            "bucket",
+            1
+        ));
+    }
+
+    #[test]
+    fn enforces_eq_conditions() {
+        let policy = serde_json::json!({
+            "conditions": [["eq", "$key", "uploads/file.txt"]]
+        });
+        assert!(policy_allows(
+            &policy,
+            &fields("uploads/file.txt"),
+            "bucket",
+            1
+        ));
+        assert!(!policy_allows(
+            &policy,
+            &fields("uploads/other.txt"),
+            "bucket",
+            1
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_array_conditions() {
+        let policy = serde_json::json!({
+            "conditions": [["unknown", "$key", "uploads/"]]
+        });
+        assert!(!policy_allows(
+            &policy,
+            &fields("uploads/file.txt"),
+            "bucket",
+            1
+        ));
+    }
 }
