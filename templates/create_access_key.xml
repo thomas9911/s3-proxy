@@ -1,0 +1,14 @@
+<CreateAccessKeyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">
+  <CreateAccessKeyResult>
+    <AccessKey>
+      <UserName>{{ user_name }}</UserName>
+      <AccessKeyId>{{ access_key }}</AccessKeyId>
+      <Status>Active</Status>
+      <SecretAccessKey>{{ secret_key }}</SecretAccessKey>
+      <CreateDate>{{ create_date }}</CreateDate>
+    </AccessKey>
+  </CreateAccessKeyResult>
+  <ResponseMetadata>
+    <RequestId>s3-proxy</RequestId>
+  </ResponseMetadata>
+</CreateAccessKeyResponse>

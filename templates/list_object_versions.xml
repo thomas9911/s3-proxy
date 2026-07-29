@@ -1,0 +1,18 @@
+<ListVersionsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>{{ bucket_name }}</Name>
+  <IsTruncated>false</IsTruncated>
+{% for version in versions %}  <Version>
+    <Key>{{ version.key }}</Key>
+    <VersionId>{{ version.version_id }}</VersionId>
+    <IsLatest>{{ version.is_latest }}</IsLatest>
+    <LastModified>{{ version.last_modified }}</LastModified>
+    <Size>{{ version.size }}</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Version>
+{% endfor %}{% for marker in delete_markers %}  <DeleteMarker>
+    <Key>{{ marker.key }}</Key>
+    <VersionId>{{ marker.version_id }}</VersionId>
+    <IsLatest>{{ marker.is_latest }}</IsLatest>
+    <LastModified>{{ marker.last_modified }}</LastModified>
+  </DeleteMarker>
+{% endfor %}</ListVersionsResult>

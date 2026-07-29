@@ -1,228 +1,27 @@
-use std::borrow::Cow;
+mod buckets;
+mod list;
+#[cfg(feature = "management")]
+mod management;
+mod objects;
+mod post;
 
-use crate::signature::VerifiedRequest;
-use crate::{templates, AppState};
-use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
-use axum::response::IntoResponse;
-use axum_route_error::RouteError;
-use opendal::Metakey;
-use tokio_stream::StreamExt;
+pub use access_keys::create_access_key;
+pub use buckets::{delete_bucket_route, list_buckets, put_bucket};
+pub use list::get_bucket;
+#[cfg(feature = "management")]
+pub use management::{
+    management_abort_multipart_upload, management_audit, management_buckets,
+    management_buckets_fragment, management_create_access_key, management_create_bucket,
+    management_create_bucket_fragment, management_dashboard, management_delete_access_key,
+    management_delete_bucket, management_delete_object, management_download_object,
+    management_inspect, management_inspect_fragment, management_list_multipart_uploads,
+    management_list_objects, management_list_objects_fragment, management_metrics,
+    management_presign_object, management_presign_post, management_principals,
+    management_principals_fragment, management_quota, management_rotate_access_key,
+    management_status, management_status_fragment, management_update_access_key,
+    management_update_bucket_configuration, management_update_quota, management_upload_object,
+};
+pub use objects::{delete_object_route, get_object, head_object, put_object};
+pub use post::{post_bucket, post_object_route};
 
-pub async fn list_buckets(
-    State(AppState {
-        opendal_operator, ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<impl IntoResponse, RouteError> {
-    let namespace = &signature.namespace;
-
-    // let bucket = "testing";
-
-    // opendal_operator
-    //     .write(
-    //         &format!("{}/{}/testing.bin", namespace, bucket),
-    //         vec![0; 4096],
-    //     )
-    //     .await?;
-
-    let mut lister = opendal_operator
-        .lister_with(&format!("{}/", namespace))
-        .await?;
-
-    let mut buckets = Vec::new();
-    while let Some(entry) = lister.next().await {
-        match entry {
-            Ok(x) => {
-                if x.metadata().is_dir() {
-                    buckets.push(templates::ListBucketItem {
-                        name: x.name().trim_end_matches('/').to_string().into(),
-                        timestamp: None,
-                    })
-                }
-            }
-            Err(e) => {
-                tracing::error!("{}", e.to_string());
-                return Err(RouteError::new_internal_server());
-            }
-        }
-    }
-
-    // let datetime = OffsetDateTime::from_unix_timestamp(1706911595)?;
-    // let tmp_timestamp = datetime.format(&Rfc3339).unwrap();
-
-    let template = templates::ListBucketsTemplate {
-        owner_name: "Testing",
-        owner_id: "1",
-        // buckets: vec![
-        //     templates::ListBucketItem {
-        //         name: "testing1".into(),
-        //         timestamp: Some(tmp_timestamp.into()),
-        //     },
-        //     templates::ListBucketItem {
-        //         name: "testing2".into(),
-        //         timestamp: None,
-        //     },
-        // ],
-        buckets,
-    };
-
-    Ok(askama_axum::into_response(&template))
-}
-
-pub async fn create_bucket(
-    Path(bucket_name): Path<String>,
-    State(AppState {
-        opendal_operator, ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<impl IntoResponse, RouteError> {
-    let namespace = &signature.namespace;
-
-    let utf8_slice = std::str::from_utf8(&signature.bytes)?;
-
-    let _body: Option<templates::CreateBucket> = quick_xml::de::from_str(utf8_slice)?;
-
-    opendal_operator
-        .create_dir(&format!("{}/", namespace))
-        .await?;
-    opendal_operator
-        .create_dir(&format!("{}/{}/", namespace, bucket_name))
-        .await?;
-
-    Ok("OK".into_response())
-}
-
-pub async fn create_object(
-    Path((bucket_name, object_name)): Path<(String, String)>,
-    header_map: HeaderMap,
-    State(AppState {
-        opendal_operator, ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<impl IntoResponse, RouteError> {
-    let namespace = signature.namespace;
-
-    if opendal_operator
-        .is_exist(&format!("{}/{}", namespace, bucket_name))
-        .await?
-    {
-        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
-    }
-
-    let mut writer = opendal_operator.write_with(
-        &format!("{}/{}/{}", namespace, bucket_name, object_name),
-        signature.bytes,
-    );
-
-    writer = if let Some(content_type) = header_map.get(CONTENT_TYPE) {
-        if let Ok(content_type) = content_type.to_str() {
-            writer.content_type(content_type)
-        } else {
-            writer
-        }
-    } else {
-        writer
-    };
-
-    writer.await?;
-
-    Ok("OK".into_response())
-}
-
-pub async fn get_object(
-    Path((bucket_name, object_name)): Path<(String, String)>,
-    State(AppState {
-        opendal_operator, ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<impl IntoResponse, RouteError> {
-    let namespace = signature.namespace;
-
-    if opendal_operator
-        .is_exist(&format!("{}/{}", namespace, bucket_name))
-        .await?
-    {
-        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
-    }
-
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
-    let metadata = if let Ok(metadata) = opendal_operator.stat(&filepath).await {
-        metadata
-    } else {
-        // maybe actually check if the error is not found :D
-        return Ok((StatusCode::NOT_FOUND, "NOT FOUND").into_response());
-    };
-
-    let reader = opendal_operator.reader(&filepath).await?;
-
-    let mut response_headers = HeaderMap::new();
-
-    if let Some(content_type) = metadata.content_type() {
-        response_headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
-    }
-
-    response_headers.insert(
-        CONTENT_LENGTH,
-        HeaderValue::from_str(&metadata.content_length().to_string())?,
-    );
-
-    Ok((response_headers, Body::from_stream(reader)).into_response())
-}
-
-pub async fn list_objects(
-    Path(bucket_name): Path<String>,
-    State(AppState {
-        opendal_operator, ..
-    }): State<AppState>,
-    signature: VerifiedRequest,
-) -> Result<impl IntoResponse, RouteError> {
-    let namespace = &signature.namespace;
-
-    let mut lister = opendal_operator
-        .lister_with(&format!("{}/{}/", namespace, bucket_name))
-        .recursive(true)
-        .metakey(Metakey::ContentLength | Metakey::Etag | Metakey::LastModified)
-        .await?;
-
-    let mut objects = Vec::new();
-    while let Some(entry) = lister.next().await {
-        match entry {
-            Ok(x) => {
-                let metadata = x.metadata();
-                if metadata.is_file() {
-                    let key = x.name().to_string().into();
-                    let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
-                    let last_modified = metadata
-                        .last_modified()
-                        .map(|dt| Cow::from(dt.to_rfc3339()));
-                    let size = metadata.content_length();
-                    objects.push(templates::ListObjectItem {
-                        key,
-                        etag,
-                        last_modified,
-                        size,
-                    })
-                }
-            }
-            Err(e) => {
-                tracing::error!("{}", e.to_string());
-                return Err(RouteError::new_internal_server());
-            }
-        }
-    }
-
-    let template = templates::ListObjectsTemplate {
-        objects,
-        is_truncated: false,
-        marker: Cow::from(""),
-        next_marker: Cow::from(""),
-        bucket_name: Cow::from(bucket_name),
-        prefix: Cow::from(""),
-        max_keys: 1000,
-    };
-
-    Ok(askama_axum::into_response(&template))
-}
+mod access_keys;

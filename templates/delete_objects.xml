@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+{%- for key in deleted %}
+    <Deleted><Key>{{ key }}</Key></Deleted>
+{%- endfor %}
+{%- for error in errors %}
+    <Error><Key>{{ error.key }}</Key><Code>{{ error.code }}</Code><Message>{{ error.message }}</Message></Error>
+{%- endfor %}
+</DeleteResult>

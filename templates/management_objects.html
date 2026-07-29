@@ -1,0 +1,7 @@
+{% if objects.len() == 0 %}
+<tr><td colspan="2">No files</td></tr>
+{% else %}
+{% for object in objects %}
+<tr><td><code>{{ object.key }}</code></td><td>{{ object.size }}</td><td><form hx-delete="/admin/api/objects" hx-confirm="Delete this object?"><input type="hidden" name="namespace" value="{{ namespace }}"><input type="hidden" name="bucket" value="{{ bucket }}"><input type="hidden" name="key" value="{{ object.key }}"><input type="hidden" name="confirm" value="true"><button type="submit">Delete</button></form></td></tr>
+{% endfor %}
+{% endif %}

@@ -1,0 +1,21 @@
+{
+	"name": "s3-proxy-regression-tests",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "bun test tests/s3-regression.test.ts",
+		"regression": "bun run tests/run-regression.ts",
+		"typecheck": "tsc -p tsconfig.json",
+		"crap": "cargo llvm-cov --lcov --output-path lcov.info && python ./scripts/normalize-lcov.py lcov.info lcov.relative.info && cargo crap --lcov lcov.relative.info --top 20 --format json"
+	},
+	"dependencies": {
+		"@aws-sdk/client-s3": "^3.1095.0",
+		"@aws-sdk/s3-presigned-post": "^3.1095.0"
+	},
+	"devDependencies": {
+		"@smithy/core": "^3.29.8",
+		"@smithy/signature-v4": "^5.6.9",
+		"@types/bun": "^1.3.14",
+		"typescript": "^7.0.2"
+	}
+}
