@@ -7,13 +7,14 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, CompletedPart, Delete, ObjectIdentifier, Owner};
 use aws_sdk_s3::Client;
 use s3_proxy::metadata::MetaDataBackend;
-use s3_proxy::{build_app, AdminConfig, AppState, Config, SqliteConfig};
+use s3_proxy::{build_app, AdminConfig, AppState, Config, ManagementConfig, SqliteConfig};
 
 #[tokio::test]
 async fn test_it_runs_in_process() {
     let config = Config {
         server_host: "127.0.0.1:0".to_string(),
         external_server_host: "http://127.0.0.1:0".to_string(),
+        max_request_body_bytes: 256 * 1024 * 1024,
         metadata_backend: MetaDataBackend::Sqlite,
         redis: None,
         sqlite: Some(SqliteConfig {
@@ -24,6 +25,11 @@ async fn test_it_runs_in_process() {
             access_key: "ANOTREAL".to_string(),
             secret_key: "notrealrnrELgWzOk3IfjzDKtFBhDby".to_string(),
         }),
+        management: Some(ManagementConfig {
+            username: "dashboard".to_string(),
+            password: "dashboard-secret".to_string(),
+        }),
+        quotas: s3_proxy::quota::QuotaConfig::default(),
         opendal_provider: "memory".to_string(),
         opendal: HashMap::new(),
     };

@@ -10,9 +10,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let config = Config::from_env()?;
-    tracing_subscriber::fmt()
-        .with_max_level(Level::ERROR)
-        .init();
+    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
     let server_host = config.server_host.clone();
     let app_state = AppState::from_config(config).await?;

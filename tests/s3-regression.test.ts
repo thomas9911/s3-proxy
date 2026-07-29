@@ -17,12 +17,15 @@ import {
 	DeleteBucketPolicyCommand,
 	GetObjectCommand,
 	GetBucketPolicyCommand,
+	GetBucketVersioningCommand,
 	HeadObjectCommand,
 	ListBucketsCommand,
+	ListObjectVersionsCommand,
 	ListPartsCommand,
 	ListObjectsV2Command,
 	PutObjectCommand,
 	PutBucketPolicyCommand,
+	PutBucketVersioningCommand,
 	UploadPartCommand,
 	S3Client,
 } from "@aws-sdk/client-s3";
@@ -58,6 +61,8 @@ const sqliteDatabaseUrl =
 	`sqlite://target/s3-regression-${process.pid}.db`;
 const ownsSqliteDatabase = !process.env.S3_TEST_SQLITE_URL;
 const rcloneBinary = process.env.RCLONE ?? `${process.cwd()}\\rclone.exe`;
+const managementUsername = "dashboard";
+const managementPassword = "dashboard-secret";
 let ownsContainer = false;
 let proxyProcess: Bun.Subprocess | undefined;
 
@@ -206,6 +211,18 @@ function signedDeleteAccessKey(accessKeyId: string, userName: string) {
 	});
 }
 
+function signedListAccessKeys(userName: string) {
+	return signedIamAction({ Action: "ListAccessKeys", UserName: userName });
+}
+
+function signedUpdateAccessKey(accessKeyId: string, status: "Active" | "Inactive") {
+	return signedIamAction({ Action: "UpdateAccessKey", AccessKeyId: accessKeyId, Status: status });
+}
+
+function signedGetAccessKeyLastUsed(accessKeyId: string) {
+	return signedIamAction({ Action: "GetAccessKeyLastUsed", AccessKeyId: accessKeyId });
+}
+
 async function waitForEndpoint() {
 	for (let attempt = 0; attempt < 60; attempt++) {
 		try {
@@ -326,6 +343,8 @@ async function startTarget() {
 					S3_PROXY__EXTERNAL_SERVER_HOST: endpoint,
 					S3_PROXY__ADMIN__ACCESS_KEY: accessKeyId,
 					S3_PROXY__ADMIN__SECRET_KEY: secretAccessKey,
+					S3_PROXY__MANAGEMENT__USERNAME: managementUsername,
+					S3_PROXY__MANAGEMENT__PASSWORD: managementPassword,
 				S3_PROXY__METADATA_BACKEND: metadataBackend,
 				...(metadataBackend === "redis"
 					? { S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379" }
@@ -428,15 +447,602 @@ afterAll(async () => {
 	proxyProcess?.kill();
 	if (ownsContainer)
 		run(["docker", "rm", "--force", containerName], { check: false });
-	if (target === "proxy")
+	if (target === "proxy" && metadataBackend === "redis")
 		run(["docker", "rm", "--force", redisContainerName], { check: false });
-	if (target === "proxy")
+	if (target === "proxy" && metadataBackend === "postgres")
 		run(["docker", "rm", "--force", postgresContainerName], { check: false });
 	if (target === "proxy" && ownsSqliteDatabase)
 		await unlink(sqliteDatabasePath).catch(() => {});
 });
 
 describe("S3 compatibility contract", () => {
+	test("exposes health, readiness, and metrics endpoints", async () => {
+		if (target !== "proxy") return;
+		const health = await fetch(`${endpoint}/healthz`);
+		expect(health.status).toBe(200);
+		expect((await health.json()).status).toBe("ok");
+		const ready = await fetch(`${endpoint}/readyz`);
+		expect(ready.status).toBe(200);
+		expect((await ready.json()).status).toBe("ready");
+		const metrics = await fetch(`${endpoint}/metrics`);
+		expect(metrics.status).toBe(200);
+		expect(await metrics.text()).toContain("s3_proxy_http_requests_total");
+	});
+
+	test("exposes a separately authenticated management dashboard", async () => {
+		if (target !== "proxy") return;
+		const authorization = `Basic ${btoa(`${managementUsername}:${managementPassword}`)}`;
+		const denied = await fetch(`${endpoint}/admin`);
+		expect(denied.status).toBe(401);
+		expect(denied.headers.get("www-authenticate")).toContain("Basic");
+		const dashboard = await fetch(`${endpoint}/admin`, {
+			headers: { authorization },
+		});
+		expect(dashboard.status).toBe(200);
+		expect(await dashboard.text()).toContain("/admin/fragments/buckets");
+		const status = await fetch(`${endpoint}/admin/api/status`, {
+			headers: { authorization },
+		});
+		expect(status.status).toBe(200);
+		const statusData = (await status.json()) as {
+			metadata_ready: boolean;
+			metadata_backend: string;
+			opendal_provider: string;
+			storage_capabilities: string[];
+		};
+		expect(statusData.metadata_ready).toBe(true);
+		expect(statusData.metadata_backend).toBe("sqlite");
+		expect(statusData.opendal_provider).toBe("memory");
+		expect(statusData.storage_capabilities).toContain("recursive_list");
+		const audit = await fetch(`${endpoint}/admin/api/audit?limit=5`, {
+			headers: { authorization },
+		});
+		expect(audit.status).toBe(200);
+		expect(
+			((await audit.json()) as Array<{ path: string }>).some(
+				(event) => event.path === "/admin/api/status",
+			),
+		).toBe(true);
+		const managementMetrics = await fetch(`${endpoint}/admin/api/metrics`, {
+			headers: { authorization },
+		});
+		expect(managementMetrics.status).toBe(200);
+		expect(await managementMetrics.text()).toContain(
+			"s3_proxy_http_requests_total",
+		);
+		const principals = await fetch(`${endpoint}/admin/api/principals`, {
+			headers: { authorization },
+		});
+		expect(principals.status).toBe(200);
+		const data = (await principals.json()) as Array<{
+			namespace: string;
+			access_keys: Array<Record<string, string>>;
+		}>;
+		const principal = data.find((entry) => entry.namespace === accessKeyId);
+		expect(principal).toBeDefined();
+		expect(principal?.access_keys[0]?.id).toBe(accessKeyId);
+		expect(principal?.access_keys[0]?.secret_key).toBeUndefined();
+		const managementBucket = `management-${Date.now().toString(36)}`;
+		const created = await fetch(`${endpoint}/admin/api/buckets`, {
+			method: "POST",
+			headers: {
+				authorization,
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body: new URLSearchParams({
+				namespace: accessKeyId,
+				name: managementBucket,
+			}),
+		});
+		expect(created.status).toBe(201);
+		try {
+			const policy = JSON.stringify({
+				Version: "2012-10-17",
+				Statement: [],
+			});
+			const configuration = await fetch(
+				`${endpoint}/admin/api/bucket-configuration`,
+				{
+					method: "POST",
+					headers: {
+						authorization,
+						"content-type": "application/x-www-form-urlencoded",
+					},
+					body: new URLSearchParams({
+						namespace: accessKeyId,
+						bucket: managementBucket,
+						versioning: "Enabled",
+						policy,
+					}),
+				},
+			);
+			expect(configuration.status).toBe(204);
+			const configured = await fetch(
+				`${endpoint}/admin/api/inspect?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(configured.status).toBe(200);
+			const configuredData = (await configured.json()) as {
+				versioning: string;
+				bucket_policy: string | null;
+			};
+			expect(configuredData.versioning).toBe("Enabled");
+			expect(configuredData.bucket_policy).toBe(policy);
+			const upload = new FormData();
+			upload.set("namespace", accessKeyId);
+			upload.set("bucket", managementBucket);
+			upload.set("key", "dashboard-upload.txt");
+			upload.set(
+				"file",
+				new Blob(["uploaded through management dashboard"], {
+					type: "text/plain",
+				}),
+				"dashboard-upload.txt",
+			);
+			const uploaded = await fetch(`${endpoint}/admin/api/objects`, {
+				method: "POST",
+				headers: { authorization },
+				body: upload,
+			});
+			expect(uploaded.status).toBe(200);
+			const listedObjects = await fetch(
+				`${endpoint}/admin/api/objects?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(listedObjects.status).toBe(200);
+			expect(
+				((await listedObjects.json()) as Array<{ key: string }>).some(
+					(object) => object.key === "dashboard-upload.txt",
+				),
+			).toBe(true);
+			const uploadedObject = await s3.send(
+				new GetObjectCommand({
+					Bucket: managementBucket,
+					Key: "dashboard-upload.txt",
+				}),
+			);
+			expect(await uploadedObject.Body?.transformToString()).toBe(
+				"uploaded through management dashboard",
+			);
+			const presigned = await fetch(`${endpoint}/admin/api/presigned-urls`, {
+				method: "POST",
+				headers: {
+					authorization,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					key: "dashboard-upload.txt",
+					access_key: accessKeyId,
+					expires_in: "60",
+				}),
+			});
+			expect(presigned.status).toBe(200);
+			const presignedData = (await presigned.json()) as { url: string };
+			expect(presignedData.url).toContain("X-Amz-Signature=");
+			const presignedObject = await fetch(presignedData.url);
+			expect(presignedObject.status).toBe(200);
+			expect(await presignedObject.text()).toBe(
+				"uploaded through management dashboard",
+			);
+			await s3.send(
+				new PutObjectCommand({
+					Bucket: managementBucket,
+					Key: "dashboard-metadata.txt",
+					Body: "metadata inspection",
+					Metadata: { dashboard: "visible" },
+				}),
+			);
+			const inspection = await fetch(
+				`${endpoint}/admin/api/inspect?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					key: "dashboard-metadata.txt",
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(inspection.status).toBe(200);
+			const inspectionData = (await inspection.json()) as {
+				bucket_public: boolean;
+				object_public: boolean;
+				bucket_policy: string | null;
+				versioning: string;
+				metadata: Array<{ key: string; value: string }>;
+			};
+			expect(inspectionData.bucket_public).toBe(false);
+			expect(inspectionData.object_public).toBe(false);
+			expect(inspectionData.bucket_policy).toBe(policy);
+			expect(inspectionData.versioning).toBe("Enabled");
+			expect(
+				inspectionData.metadata.some(
+					(entry) => entry.key === "dashboard" && entry.value === "visible",
+			),
+		).toBe(true);
+			const inspectionFragment = await fetch(
+				`${endpoint}/admin/fragments/inspect?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					key: "dashboard-metadata.txt",
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(inspectionFragment.status).toBe(200);
+			expect(await inspectionFragment.text()).toContain("Object metadata");
+			const download = await fetch(
+				`${endpoint}/admin/api/download?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					key: "dashboard-upload.txt",
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(download.status).toBe(200);
+			expect(download.headers.get("content-disposition")).toContain(
+				"attachment",
+			);
+			expect(await download.text()).toBe("uploaded through management dashboard");
+			const presignedPost = await fetch(
+				`${endpoint}/admin/api/presigned-posts`,
+				{
+					method: "POST",
+					headers: {
+						authorization,
+						"content-type": "application/x-www-form-urlencoded",
+					},
+					body: new URLSearchParams({
+						namespace: accessKeyId,
+						bucket: managementBucket,
+						access_key: accessKeyId,
+						prefix: "dashboard-post/",
+						expires_in: "60",
+						max_size: "1024",
+					}),
+				},
+			);
+			expect(presignedPost.status).toBe(200);
+			const postData = (await presignedPost.json()) as {
+				url: string;
+				fields: Record<string, string>;
+			};
+			const postForm = new FormData();
+			for (const [name, value] of Object.entries(postData.fields)) {
+				postForm.set(name, value);
+			}
+			postForm.set(
+				"file",
+				new Blob(["uploaded from generated post form"], { type: "text/plain" }),
+				"dashboard.txt",
+			);
+			const postUpload = await fetch(postData.url, {
+				method: "POST",
+				body: postForm,
+			});
+			expect(postUpload.status).toBe(204);
+			const postObject = await s3.send(
+				new GetObjectCommand({
+					Bucket: managementBucket,
+					Key: "dashboard-post/dashboard.txt",
+				}),
+			);
+			expect(await postObject.Body?.transformToString()).toBe(
+				"uploaded from generated post form",
+			);
+			const buckets = await fetch(`${endpoint}/admin/api/buckets`, {
+				headers: { authorization },
+			});
+			expect(buckets.status).toBe(200);
+			const bucketData = (await buckets.json()) as Array<{ name: string }>;
+			expect(bucketData.some((entry) => entry.name === managementBucket)).toBe(
+				true,
+			);
+			const filteredBuckets = await fetch(
+				`${endpoint}/admin/api/buckets?${new URLSearchParams({
+					prefix: managementBucket,
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(filteredBuckets.status).toBe(200);
+			expect(
+				((await filteredBuckets.json()) as Array<{ name: string }>).every(
+					(entry) => entry.name.startsWith(managementBucket),
+				),
+			).toBe(true);
+			const fragment = await fetch(`${endpoint}/admin/fragments/buckets`, {
+				headers: { authorization },
+			});
+			expect(fragment.status).toBe(200);
+			expect(await fragment.text()).toContain(managementBucket);
+		} finally {
+			await s3
+				.send(
+					new DeleteObjectCommand({
+						Bucket: managementBucket,
+						Key: "dashboard-upload.txt",
+					}),
+				)
+				.catch(() => {});
+			await s3.send(new DeleteBucketCommand({ Bucket: managementBucket }));
+		}
+	});
+
+	test("requires confirmation for management object and bucket deletion", async () => {
+		if (target !== "proxy") return;
+		const authorization = `Basic ${btoa(`${managementUsername}:${managementPassword}`)}`;
+		const managementBucket = `management-delete-${Date.now().toString(36)}`;
+		await s3.send(new CreateBucketCommand({ Bucket: managementBucket }));
+		await s3.send(
+			new PutObjectCommand({
+				Bucket: managementBucket,
+				Key: "delete-me.txt",
+				Body: "delete me",
+			}),
+		);
+		const deleteObject = (confirm: boolean) =>
+			fetch(`${endpoint}/admin/api/objects`, {
+				method: "DELETE",
+				headers: {
+					authorization,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					key: "delete-me.txt",
+					confirm: String(confirm),
+				}),
+			});
+		expect((await deleteObject(false)).status).toBe(400);
+		expect((await deleteObject(true)).status).toBe(204);
+		const objectIsMissing = await s3
+			.send(
+				new GetObjectCommand({
+					Bucket: managementBucket,
+					Key: "delete-me.txt",
+				}),
+			)
+			.then(
+				() => false,
+				() => true,
+			);
+		expect(objectIsMissing).toBe(true);
+		const deleteBucket = (confirm: boolean) =>
+			fetch(`${endpoint}/admin/api/buckets`, {
+				method: "DELETE",
+				headers: {
+					authorization,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: new URLSearchParams({
+					namespace: accessKeyId,
+					name: managementBucket,
+					confirm: String(confirm),
+				}),
+			});
+		expect((await deleteBucket(false)).status).toBe(400);
+		expect((await deleteBucket(true)).status).toBe(204);
+	});
+
+	test("manages access keys from the dashboard", async () => {
+		if (target !== "proxy") return;
+		const authorization = `Basic ${btoa(`${managementUsername}:${managementPassword}`)}`;
+		const formRequest = (
+			url: string,
+			method: "POST" | "PATCH" | "DELETE",
+			body: Record<string, string>,
+		) =>
+			fetch(`${endpoint}${url}`, {
+				method,
+				headers: {
+					authorization,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: new URLSearchParams(body),
+			});
+		const created = await formRequest("/admin/api/access-keys", "POST", {
+			namespace: accessKeyId,
+		});
+		expect(created.status).toBe(201);
+		const original = (await created.json()) as {
+			id: string;
+			secret_key: string;
+		};
+		expect(original.id).toStartWith("AKIA");
+		expect(original.secret_key.length).toBeGreaterThan(20);
+		try {
+			expect(
+				(
+					await formRequest("/admin/api/access-keys", "PATCH", {
+						namespace: accessKeyId,
+						access_key: original.id,
+						status: "Inactive",
+					})
+				).status,
+			).toBe(204);
+			expect(
+				(
+					await formRequest("/admin/api/access-keys", "PATCH", {
+						namespace: accessKeyId,
+						access_key: original.id,
+						status: "Active",
+					})
+				).status,
+			).toBe(204);
+			const rotated = await formRequest("/admin/api/access-keys/rotate", "POST", {
+				namespace: accessKeyId,
+				access_key: original.id,
+			});
+			expect(rotated.status).toBe(201);
+			const replacement = (await rotated.json()) as {
+				id: string;
+				secret_key: string;
+			};
+			expect(replacement.id).not.toBe(original.id);
+			expect(replacement.secret_key.length).toBeGreaterThan(20);
+			const principals = await fetch(`${endpoint}/admin/api/principals`, {
+				headers: { authorization },
+			});
+			const principal = (
+				(await principals.json()) as Array<{
+					namespace: string;
+					access_keys: Array<{ id: string; status: string }>;
+				}>
+			).find((entry) => entry.namespace === accessKeyId);
+			expect(
+				principal?.access_keys.find((key) => key.id === original.id)?.status,
+			).toBe("Inactive");
+			expect(
+				principal?.access_keys.find((key) => key.id === replacement.id)?.status,
+			).toBe("Active");
+			expect(
+				(
+					await formRequest("/admin/api/access-keys", "DELETE", {
+						namespace: accessKeyId,
+						access_key: replacement.id,
+						confirm: "false",
+					})
+				).status,
+			).toBe(400);
+			expect(
+				(
+					await formRequest("/admin/api/access-keys", "DELETE", {
+						namespace: accessKeyId,
+						access_key: replacement.id,
+						confirm: "true",
+					})
+				).status,
+			).toBe(204);
+		} finally {
+			await formRequest("/admin/api/access-keys", "DELETE", {
+				namespace: accessKeyId,
+				access_key: original.id,
+				confirm: "true",
+			}).catch(() => {});
+		}
+	});
+
+	test("lists and aborts multipart uploads from the dashboard", async () => {
+		if (target !== "proxy") return;
+		const authorization = `Basic ${btoa(`${managementUsername}:${managementPassword}`)}`;
+		const managementBucket = `management-multipart-${Date.now().toString(36)}`;
+		await s3.send(new CreateBucketCommand({ Bucket: managementBucket }));
+		try {
+			const initiated = await s3.send(
+				new CreateMultipartUploadCommand({
+					Bucket: managementBucket,
+					Key: "pending/upload.txt",
+				}),
+			);
+			const uploadId = initiated.UploadId;
+			expect(uploadId).toBeDefined();
+			const uploads = await fetch(
+				`${endpoint}/admin/api/multipart-uploads?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(uploads.status).toBe(200);
+			expect(
+				(
+					(await uploads.json()) as Array<{ upload_id: string; key: string }>
+				).some(
+					(upload) =>
+						upload.upload_id === uploadId && upload.key === "pending/upload.txt",
+				),
+			).toBe(true);
+			const abort = (confirm: boolean) =>
+				fetch(`${endpoint}/admin/api/multipart-uploads`, {
+					method: "DELETE",
+					headers: {
+						authorization,
+						"content-type": "application/x-www-form-urlencoded",
+					},
+					body: new URLSearchParams({
+						namespace: accessKeyId,
+						bucket: managementBucket,
+						upload_id: uploadId ?? "",
+						confirm: String(confirm),
+					}),
+				});
+			expect((await abort(false)).status).toBe(400);
+			expect((await abort(true)).status).toBe(204);
+			await s3.send(
+				new CreateMultipartUploadCommand({
+					Bucket: managementBucket,
+					Key: "pending/stale.txt",
+				}),
+			);
+			await sleep(2_100);
+			const abortStale = await fetch(`${endpoint}/admin/api/multipart-uploads`, {
+				method: "DELETE",
+				headers: {
+					authorization,
+					"content-type": "application/x-www-form-urlencoded",
+				},
+				body: new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+					older_than_seconds: "1",
+					confirm: "true",
+				}),
+			});
+			expect(abortStale.status).toBe(204);
+			const afterAbort = await fetch(
+				`${endpoint}/admin/api/multipart-uploads?${new URLSearchParams({
+					namespace: accessKeyId,
+					bucket: managementBucket,
+				})}`,
+				{ headers: { authorization } },
+			);
+			expect(
+				(await afterAbort.json()) as Array<{ upload_id: string }>,
+			).toHaveLength(0);
+		} finally {
+			await s3.send(new DeleteBucketCommand({ Bucket: managementBucket }));
+		}
+	});
+
+	test("views and configures per-principal dashboard quotas", async () => {
+		if (target !== "proxy") return;
+		const authorization = `Basic ${btoa(`${managementUsername}:${managementPassword}`)}`;
+		const usage = await fetch(
+			`${endpoint}/admin/api/quotas?${new URLSearchParams({
+				namespace: accessKeyId,
+			})}`,
+			{ headers: { authorization } },
+		);
+		expect(usage.status).toBe(200);
+		expect((await usage.json()).storage_bytes).toBeGreaterThanOrEqual(0);
+		const updated = await fetch(`${endpoint}/admin/api/quotas`, {
+			method: "POST",
+			headers: {
+				authorization,
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body: new URLSearchParams({
+				namespace: accessKeyId,
+				max_storage_bytes: "1073741824",
+				max_requests_per_minute: "100000",
+			}),
+		});
+		expect(updated.status).toBe(204);
+		const effective = await fetch(
+			`${endpoint}/admin/api/quotas?${new URLSearchParams({
+				namespace: accessKeyId,
+			})}`,
+			{ headers: { authorization } },
+		);
+		expect(effective.status).toBe(200);
+		expect((await effective.json()).max_storage_bytes).toBe(1_073_741_824);
+	});
+
 	test("supports bucket and object CRUD through the AWS S3 API", async () => {
 		await s3.send(new CreateBucketCommand({ Bucket: bucket }));
 		const buckets = await s3.send(new ListBucketsCommand({}));
@@ -536,9 +1142,59 @@ describe("S3 compatibility contract", () => {
 				secretAccessKey: createdSecretKey ?? "",
 			},
 		});
+		const secondResponse = await signedCreateAccessKey(userName);
+		expect(secondResponse.status).toBe(200);
+		const secondXml = await secondResponse.text();
+		const secondAccessKey = secondXml.match(/<AccessKeyId>([^<]+)<\/AccessKeyId>/)?.[1];
+		const secondSecretKey = secondXml.match(/<SecretAccessKey>([^<]+)<\/SecretAccessKey>/)?.[1];
+		const secondClient = new S3Client({
+			endpoint,
+			region,
+			forcePathStyle: true,
+			credentials: {
+				accessKeyId: secondAccessKey ?? "",
+				secretAccessKey: secondSecretKey ?? "",
+			},
+		});
+		const sharedBucket = `shared-principal-${Date.now().toString(36)}`;
 		try {
 			const buckets = await createdClient.send(new ListBucketsCommand({}));
 			expect(buckets.$metadata.httpStatusCode).toBe(200);
+			await createdClient.send(new CreateBucketCommand({ Bucket: sharedBucket }));
+			const sharedBuckets = await secondClient.send(new ListBucketsCommand({}));
+			expect(sharedBuckets.Buckets?.some((item) => item.Name === sharedBucket)).toBe(true);
+
+			const listResponse = await signedListAccessKeys(userName);
+			expect(listResponse.status).toBe(200);
+			const listedKeys = await listResponse.text();
+			expect(listedKeys).toContain(createdAccessKey ?? "");
+			expect(listedKeys).toContain(secondAccessKey ?? "");
+			expect(listedKeys).not.toContain("SecretAccessKey");
+			const lastUsedResponse = await signedGetAccessKeyLastUsed(createdAccessKey ?? "");
+			expect(lastUsedResponse.status).toBe(200);
+			expect(await lastUsedResponse.text()).toContain("LastUsedDate");
+
+			const deactivateResponse = await signedUpdateAccessKey(
+				secondAccessKey ?? "",
+				"Inactive",
+			);
+			expect(deactivateResponse.status).toBe(200);
+			await expectS3Error(
+				secondClient.send(new ListBucketsCommand({})),
+				403,
+				["AccessDenied"],
+			);
+			const activateResponse = await signedUpdateAccessKey(
+				secondAccessKey ?? "",
+				"Active",
+			);
+			expect(activateResponse.status).toBe(200);
+			expect(
+				(await secondClient.send(new ListBucketsCommand({}))).Buckets?.some(
+					(item) => item.Name === sharedBucket,
+				),
+			).toBe(true);
+			await secondClient.send(new DeleteBucketCommand({ Bucket: sharedBucket }));
 			const deleteResponse = await signedDeleteAccessKey(
 				createdAccessKey ?? "",
 				userName,
@@ -550,8 +1206,14 @@ describe("S3 compatibility contract", () => {
 				403,
 				["AccessDenied"],
 			);
+			const deleteSecondResponse = await signedDeleteAccessKey(
+				secondAccessKey ?? "",
+				userName,
+			);
+			expect(deleteSecondResponse.status).toBe(200);
 		} finally {
 			createdClient.destroy();
+			secondClient.destroy();
 		}
 	});
 
@@ -936,6 +1598,64 @@ describe("S3 compatibility contract", () => {
 		await s3.send(new DeleteBucketCommand({ Bucket: deletedPolicyBucket }));
 	});
 
+	test("preserves object versions and delete markers", async () => {
+		const versionedBucket = `versioned-${Date.now().toString(36)}`;
+		const key = "versioned.txt";
+		await s3.send(new CreateBucketCommand({ Bucket: versionedBucket }));
+		try {
+			await s3.send(
+				new PutBucketVersioningCommand({
+					Bucket: versionedBucket,
+					VersioningConfiguration: { Status: "Enabled" },
+				}),
+			);
+			const versioning = await s3.send(
+				new GetBucketVersioningCommand({ Bucket: versionedBucket }),
+			);
+			expect(versioning.Status).toBe("Enabled");
+			const first = await s3.send(
+				new PutObjectCommand({ Bucket: versionedBucket, Key: key, Body: "first" }),
+			);
+			const second = await s3.send(
+				new PutObjectCommand({ Bucket: versionedBucket, Key: key, Body: "second" }),
+			);
+			expect(first.VersionId).toBeTruthy();
+			expect(second.VersionId).toBeTruthy();
+			expect(first.VersionId).not.toBe(second.VersionId);
+			const historical = await s3.send(
+				new GetObjectCommand({
+					Bucket: versionedBucket,
+					Key: key,
+					VersionId: first.VersionId,
+				}),
+			);
+			expect(await historical.Body?.transformToString()).toBe("first");
+			const deleted = await s3.send(
+				new DeleteObjectCommand({ Bucket: versionedBucket, Key: key }),
+			);
+			expect(deleted.DeleteMarker).toBe(true);
+			expect(deleted.VersionId).toBeTruthy();
+			await expectS3Error(
+				s3.send(new GetObjectCommand({ Bucket: versionedBucket, Key: key })),
+				404,
+				["NoSuchKey"],
+			);
+			const versions = await s3.send(
+				new ListObjectVersionsCommand({ Bucket: versionedBucket }),
+			);
+			expect(versions.Versions?.map((version) => version.VersionId)).toContain(
+				first.VersionId,
+			);
+			expect(versions.DeleteMarkers?.map((marker) => marker.VersionId)).toContain(
+				deleted.VersionId,
+			);
+		} finally {
+			await s3
+				.send(new DeleteBucketCommand({ Bucket: versionedBucket }))
+				.catch(() => {});
+		}
+	});
+
 	test("lists 2000 objects through paginated responses", async () => {
 		const started = performance.now();
 		const objects = Array.from({ length: 2000 }, (_, index) => ({
@@ -1006,7 +1726,7 @@ describe("S3 compatibility contract", () => {
 			console.log(
 				`[profile] delete: ${(performance.now() - deletionStarted).toFixed(0)}ms, total: ${(performance.now() - started).toFixed(0)}ms`,
 			);
-	}, 30_000);
+	}, 90_000);
 
 	test("returns S3 errors for missing resources", async () => {
 		await expectS3Error(

@@ -113,9 +113,17 @@ impl FromRequest<AppState> for VerifiedRequest {
         let external_host = &config.external_server_host;
 
         if let Some(params) = parse_presigned_query(&original_uri) {
-            let secret_key = match metadata_store.secret_key(&params.access_key).await? {
-                Some(secret_key) => secret_key,
+            let access_key = match metadata_store.access_key(&params.access_key).await? {
+                Some(access_key) if access_key.status.as_str() == "Active" => access_key,
                 None => {
+                    return Err(s3_error_response(
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        "Access Denied",
+                    )
+                    .into())
+                }
+                Some(_) => {
                     return Err(s3_error_response(
                         StatusCode::FORBIDDEN,
                         "AccessDenied",
@@ -132,7 +140,7 @@ impl FromRequest<AppState> for VerifiedRequest {
                     "{external_host}{presigned_uri}",
                     presigned_uri = strip_presign_query(&original_uri)
                 ),
-                &secret_key,
+                &access_key.secret_key,
             ) {
                 return Err(s3_error_response(
                     StatusCode::FORBIDDEN,
@@ -141,9 +149,26 @@ impl FromRequest<AppState> for VerifiedRequest {
                 )
                 .into());
             }
+            if !crate::quota::allow_request(&config.quotas, &access_key.principal_id) {
+                return Err(s3_error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "SlowDown",
+                    "The request quota for this principal has been exceeded.",
+                )
+                .into());
+            }
+            tracing::info!(
+                audit = true,
+                event = "authenticated_request",
+                access_key = %params.access_key,
+                principal = %access_key.principal_id,
+            );
+            metadata_store
+                .record_access_key_use(&params.access_key)
+                .await?;
             return Ok(VerifiedRequest {
                 access_key: params.access_key.clone(),
-                namespace: params.access_key,
+                namespace: access_key.principal_id,
                 bytes,
             });
         }
@@ -160,9 +185,17 @@ impl FromRequest<AppState> for VerifiedRequest {
             }
         };
 
-        let secret_key = match metadata_store.secret_key(params.access_key).await? {
-            Some(secret_key) => secret_key,
+        let access_key = match metadata_store.access_key(params.access_key).await? {
+            Some(access_key) if access_key.status.as_str() == "Active" => access_key,
             None => {
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "Access Denied",
+                )
+                .into())
+            }
+            Some(_) => {
                 return Err(s3_error_response(
                     StatusCode::FORBIDDEN,
                     "AccessDenied",
@@ -177,7 +210,7 @@ impl FromRequest<AppState> for VerifiedRequest {
             &params,
             http_method,
             &format!("{external_host}{original_uri}"),
-            &secret_key,
+            &access_key.secret_key,
             &bytes,
         ) {
             return Err(s3_error_response(
@@ -188,9 +221,28 @@ impl FromRequest<AppState> for VerifiedRequest {
             .into());
         };
 
+        if !crate::quota::allow_request(&config.quotas, &access_key.principal_id) {
+            return Err(s3_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "SlowDown",
+                "The request quota for this principal has been exceeded.",
+            )
+            .into());
+        }
+
+        tracing::info!(
+            audit = true,
+            event = "authenticated_request",
+            access_key = %params.access_key,
+            principal = %access_key.principal_id,
+        );
+
+        metadata_store
+            .record_access_key_use(params.access_key)
+            .await?;
         Ok(VerifiedRequest {
             access_key: params.access_key.to_string(),
-            namespace: params.access_key.to_string(),
+            namespace: access_key.principal_id,
             bytes,
         })
     }
@@ -198,6 +250,71 @@ impl FromRequest<AppState> for VerifiedRequest {
 
 pub(crate) fn has_presigned_query(uri: &axum::http::Uri) -> bool {
     parse_presigned_query(uri).is_some()
+}
+
+pub(crate) fn presign_get_url(
+    external_host: &str,
+    bucket: &str,
+    key: &str,
+    access_key: &str,
+    secret_key: &str,
+    region: &str,
+    expires_in: u64,
+) -> anyhow::Result<String> {
+    if expires_in == 0 || expires_in > 604_800 {
+        anyhow::bail!("presigned URL expiry must be between 1 and 604800 seconds")
+    }
+
+    let encoded_key = key
+        .split('/')
+        .map(urlencoding::encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    let url = format!(
+        "{}/{}/{}",
+        external_host.trim_end_matches('/'),
+        urlencoding::encode(bucket),
+        encoded_key
+    );
+    let uri = url.parse::<axum::http::Uri>()?;
+    let host = uri
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("external server host must include an authority"))?
+        .as_str()
+        .to_string();
+    let identity = Credentials::new(access_key, secret_key, None, None, "management").into();
+    let mut settings = SigningSettings::default();
+    settings.percent_encoding_mode = PercentEncodingMode::Single;
+    settings.signature_location = SignatureLocation::QueryParams;
+    settings.expires_in = Some(Duration::from_secs(expires_in));
+    settings.session_token_mode = SessionTokenMode::Include;
+    settings.excluded_headers = Some(vec![
+        "authorization".into(),
+        "user-agent".into(),
+        "x-amzn-trace-id".into(),
+    ]);
+    settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    let signer = SigningParams::builder()
+        .identity(&identity)
+        .region(region)
+        .name("s3")
+        .time(SystemTime::now())
+        .settings(settings)
+        .build()?;
+    let request = SignableRequest::new(
+        "GET",
+        &url,
+        std::iter::once(("host", host.as_str())),
+        SignableBody::UnsignedPayload,
+    )?;
+    let (instructions, _) = aws_sigv4::http_request::sign(request, &signer.into())?.into_parts();
+    let mut signed_request = axum::http::Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("host", host)
+        .body(())?;
+    instructions.apply_to_request_http1x(&mut signed_request);
+    Ok(signed_request.uri().to_string())
 }
 
 fn parse_presigned_query(uri: &axum::http::Uri) -> Option<PresignedV4Params> {

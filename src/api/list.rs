@@ -22,6 +22,18 @@ pub async fn get_bucket(
         .unwrap_or_default()
         .split('&')
         .any(|part| part == "policy" || part.starts_with("policy="));
+    let is_versioning = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "versioning" || part.starts_with("versioning="));
+    let is_versions = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "versions" || part.starts_with("versions="));
     let authenticated = request
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION);
@@ -33,6 +45,8 @@ pub async fn get_bucket(
         .headers()
         .contains_key(axum::http::header::AUTHORIZATION)
         || is_policy
+        || is_versioning
+        || is_versions
     {
         match VerifiedRequest::from_request(request, &state).await {
             Ok(signature) => signature,
@@ -84,7 +98,7 @@ pub async fn get_bucket(
             }
         };
         for (namespace, policy) in policies {
-            let principal = signature.access_key.as_str();
+            let principal = signature.namespace.as_str();
             match crate::policy::decision(&policy, Some(principal), "s3:ListBucket", &resource) {
                 Ok(crate::policy::Decision::Deny) => {
                     return s3_error_response(
@@ -129,9 +143,100 @@ pub async fn get_bucket(
         };
     }
 
+    if is_versioning {
+        let status = match crate::versioning::bucket_versioning(
+            &state.opendal_operator,
+            &signature.namespace,
+            &bucket_name,
+        )
+        .await
+        {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(%error, "failed to read bucket versioning");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+        return templates::xml_response(
+            StatusCode::OK,
+            templates::GetBucketVersioningTemplate {
+                status: status.as_s3_status(),
+            },
+        );
+    }
+
+    if is_versions {
+        return list_object_versions(bucket_name, state, signature).await;
+    }
+
     list_objects_inner(bucket_name, query, state, signature)
         .await
         .map_or_else(IntoResponse::into_response, |response| response)
+}
+
+async fn list_object_versions(
+    bucket_name: String,
+    state: AppState,
+    signature: VerifiedRequest,
+) -> Response {
+    let namespace = &signature.namespace;
+    if !state
+        .opendal_operator
+        .exists(&format!("{namespace}/{bucket_name}/"))
+        .await
+        .unwrap_or(false)
+    {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        );
+    }
+    let versions =
+        match crate::versioning::list_versions(&state.opendal_operator, namespace, &bucket_name)
+            .await
+        {
+            Ok(versions) => versions,
+            Err(error) => {
+                tracing::error!(%error, "failed to list object versions");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    let mut latest = HashSet::new();
+    let mut versions_output = Vec::new();
+    let mut markers_output = Vec::new();
+    for (key, version) in versions {
+        let is_latest = latest.insert(key.clone());
+        let size = match version.data_path.as_deref() {
+            Some(path) => state
+                .opendal_operator
+                .stat(path)
+                .await
+                .map(|metadata| metadata.content_length())
+                .unwrap_or(0),
+            None => 0,
+        };
+        let item = templates::ListVersionItem {
+            key,
+            version_id: version.version_id,
+            is_latest,
+            last_modified: version.created_at,
+            size,
+        };
+        if version.is_delete_marker {
+            markers_output.push(item);
+        } else {
+            versions_output.push(item);
+        }
+    }
+    templates::xml_response(
+        StatusCode::OK,
+        templates::ListObjectVersionsTemplate {
+            bucket_name: &bucket_name,
+            versions: &versions_output,
+            delete_markers: &markers_output,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -169,6 +274,7 @@ mod tests {
             config: Arc::new(Config {
                 server_host: "127.0.0.1:0".to_string(),
                 external_server_host: "http://127.0.0.1:0".to_string(),
+                max_request_body_bytes: 256 * 1024 * 1024,
                 metadata_backend: MetaDataBackend::Sqlite,
                 redis: None,
                 sqlite: Some(SqliteConfig {
@@ -176,6 +282,8 @@ mod tests {
                 }),
                 postgres: None,
                 admin: None,
+                management: None,
+                quotas: crate::quota::QuotaConfig::default(),
                 opendal_provider: "memory".to_string(),
                 opendal: HashMap::new(),
             }),

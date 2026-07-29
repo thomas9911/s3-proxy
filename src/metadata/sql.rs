@@ -1,4 +1,4 @@
-use super::{MetadataStore, NamespaceOwner, ObjectMetadata};
+use super::{AccessKey, AccessKeyStatus, MetadataStore, NamespaceOwner, ObjectMetadata};
 use async_trait::async_trait;
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, AssertSqlSafe};
@@ -22,11 +22,23 @@ impl SqlMetadataStore {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS access_keys (
                 access_key TEXT PRIMARY KEY,
-                secret_key TEXT NOT NULL
+                secret_key TEXT NOT NULL,
+                principal_id TEXT,
+                status TEXT NOT NULL DEFAULT 'Active',
+                created_at TEXT,
+                last_used_at TEXT
             )",
         )
         .execute(&pool)
         .await?;
+        for statement in [
+            "ALTER TABLE access_keys ADD COLUMN principal_id TEXT",
+            "ALTER TABLE access_keys ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'",
+            "ALTER TABLE access_keys ADD COLUMN created_at TEXT",
+            "ALTER TABLE access_keys ADD COLUMN last_used_at TEXT",
+        ] {
+            add_column_if_missing(&pool, statement).await?;
+        }
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS namespace_owners (
                 namespace TEXT PRIMARY KEY,
@@ -78,12 +90,31 @@ impl SqlMetadataStore {
         .execute(&pool)
         .await?;
         for index in [
+            "CREATE INDEX IF NOT EXISTS idx_access_keys_principal ON access_keys (principal_id)",
             "CREATE INDEX IF NOT EXISTS idx_object_metadata_lookup ON object_metadata (namespace, bucket, object)",
             "CREATE INDEX IF NOT EXISTS idx_public_resources_lookup ON public_resources (resource_type, bucket, object)",
             "CREATE INDEX IF NOT EXISTS idx_bucket_policies_bucket ON bucket_policies (bucket)",
         ] {
             sqlx::query(index).execute(&pool).await?;
         }
+        sqlx::query("UPDATE access_keys SET principal_id = access_key WHERE principal_id IS NULL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("UPDATE access_keys SET status = 'Active' WHERE status IS NULL")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE access_keys SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO namespace_owners (namespace, display_name, owner_id)
+             SELECT principal_id, principal_id, principal_id FROM access_keys WHERE true
+             ON CONFLICT(namespace) DO NOTHING",
+        )
+        .execute(&pool)
+        .await?;
         sqlx::query(
             "INSERT INTO metadata_schema_migrations (version, applied_at)
              VALUES (1, CURRENT_TIMESTAMP)
@@ -171,22 +202,46 @@ impl SqlMetadataStore {
     }
 }
 
+async fn add_column_if_missing(pool: &AnyPool, statement: &str) -> anyhow::Result<()> {
+    match sqlx::query(AssertSqlSafe(statement.to_string()))
+        .execute(pool)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error)
+            if error.to_string().contains("duplicate column")
+                || error.to_string().contains("already exists") =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
-    async fn create_access_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<bool> {
+    async fn create_access_key(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        principal_id: &str,
+    ) -> anyhow::Result<bool> {
         let query = format!(
-            "INSERT INTO access_keys (access_key, secret_key) VALUES ({}, {})
+            "INSERT INTO access_keys (access_key, secret_key, principal_id, status, created_at)
+             VALUES ({}, {}, {}, 'Active', CURRENT_TIMESTAMP)
              ON CONFLICT(access_key) DO NOTHING",
             self.placeholder(1),
             self.placeholder(2),
+            self.placeholder(3),
         );
         let result = sqlx::query(AssertSqlSafe(query))
             .bind(access_key)
             .bind(secret_key)
+            .bind(principal_id)
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 1 {
-            self.set_namespace_owner(access_key, access_key, access_key)
+            self.set_namespace_owner(principal_id, principal_id, principal_id)
                 .await?;
             Ok(true)
         } else {
@@ -204,30 +259,105 @@ impl MetadataStore for SqliteMetadataStore {
             .execute(&self.pool)
             .await?;
         if result.rows_affected() == 1 {
-            let owner_query = format!(
-                "DELETE FROM namespace_owners WHERE namespace = {}",
-                self.placeholder(1),
-            );
-            sqlx::query(AssertSqlSafe(owner_query))
-                .bind(access_key)
-                .execute(&self.pool)
-                .await?;
             Ok(true)
         } else {
             Ok(false)
         }
     }
 
-    async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()> {
-        let first = self.placeholder(1);
-        let second = self.placeholder(2);
+    async fn access_key(&self, access_key: &str) -> anyhow::Result<Option<AccessKey>> {
         let query = format!(
-            "INSERT INTO access_keys (access_key, secret_key) VALUES ({first}, {second})
-             ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key"
+            "SELECT access_key, principal_id, status, secret_key, created_at, last_used_at
+             FROM access_keys WHERE access_key = {}",
+            self.placeholder(1),
+        );
+        let row = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(AssertSqlSafe(query))
+        .bind(access_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(access_key_from_row))
+    }
+
+    async fn list_access_keys(&self, principal_id: &str) -> anyhow::Result<Vec<AccessKey>> {
+        let query = format!(
+            "SELECT access_key, principal_id, status, secret_key, created_at, last_used_at
+             FROM access_keys WHERE principal_id = {} ORDER BY created_at, access_key",
+            self.placeholder(1),
+        );
+        let rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            ),
+        >(AssertSqlSafe(query))
+        .bind(principal_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(access_key_from_row).collect())
+    }
+
+    async fn set_access_key_status(
+        &self,
+        access_key: &str,
+        status: AccessKeyStatus,
+    ) -> anyhow::Result<bool> {
+        let query = format!(
+            "UPDATE access_keys SET status = {} WHERE access_key = {}",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        Ok(sqlx::query(AssertSqlSafe(query))
+            .bind(status.as_str())
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+            == 1)
+    }
+
+    async fn record_access_key_use(&self, access_key: &str) -> anyhow::Result<()> {
+        let query = format!(
+            "UPDATE access_keys SET last_used_at = CURRENT_TIMESTAMP WHERE access_key = {}",
+            self.placeholder(1),
+        );
+        sqlx::query(AssertSqlSafe(query))
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()> {
+        let query = format!(
+            "INSERT INTO access_keys (access_key, secret_key, principal_id, status, created_at)
+             VALUES ({}, {}, {}, 'Active', CURRENT_TIMESTAMP)
+             ON CONFLICT(access_key) DO UPDATE SET
+                 secret_key = excluded.secret_key,
+                 principal_id = COALESCE(access_keys.principal_id, excluded.principal_id),
+                 status = 'Active'",
+            self.placeholder(1),
+            self.placeholder(2),
+            self.placeholder(3),
         );
         sqlx::query(AssertSqlSafe(query))
             .bind(access_key)
             .bind(secret_key)
+            .bind(access_key)
             .execute(&self.pool)
             .await?;
         let owner_query = format!(
@@ -248,7 +378,7 @@ impl MetadataStore for SqliteMetadataStore {
 
     async fn secret_key(&self, access_key: &str) -> anyhow::Result<Option<String>> {
         Ok(sqlx::query_scalar(AssertSqlSafe(format!(
-            "SELECT secret_key FROM access_keys WHERE access_key = {}",
+            "SELECT secret_key FROM access_keys WHERE access_key = {} AND status = 'Active'",
             self.placeholder(1)
         )))
         .bind(access_key)
@@ -297,6 +427,19 @@ impl MetadataStore for SqliteMetadataStore {
             },
             |(display_name, id)| NamespaceOwner { display_name, id },
         ))
+    }
+
+    async fn list_namespace_owners(&self) -> anyhow::Result<Vec<(String, NamespaceOwner)>> {
+        let rows = sqlx::query_as::<_, (String, String, String)>(
+            "SELECT namespace, display_name, owner_id
+             FROM namespace_owners ORDER BY namespace",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(namespace, display_name, id)| (namespace, NamespaceOwner { display_name, id }))
+            .collect())
     }
 
     async fn set_object_metadata(
@@ -545,6 +688,26 @@ impl MetadataStore for SqliteMetadataStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+fn access_key_from_row(
+    (id, principal_id, status, secret_key, created_at, last_used_at): (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ),
+) -> AccessKey {
+    AccessKey {
+        id,
+        principal_id,
+        status: AccessKeyStatus::parse(&status),
+        secret_key,
+        created_at,
+        last_used_at,
     }
 }
 

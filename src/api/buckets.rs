@@ -6,6 +6,7 @@ use axum::http::StatusCode;
 use axum::http::{HeaderMap, Request};
 use axum::response::{IntoResponse, Response};
 use axum_route_error::RouteError;
+use serde::Deserialize;
 use tokio_stream::StreamExt;
 
 pub async fn list_buckets(
@@ -26,7 +27,10 @@ pub async fn list_buckets(
     while let Some(entry) = lister.next().await {
         match entry {
             Ok(entry) => {
-                if entry.metadata().is_dir() && entry.path().trim_end_matches('/') != namespace {
+                if entry.metadata().is_dir()
+                    && entry.path().trim_end_matches('/') != namespace
+                    && entry.name().trim_end_matches('/') != ".s3-proxy"
+                {
                     buckets.push(templates::ListBucketItem {
                         name: entry.name().trim_end_matches('/').to_string().into(),
                         timestamp: None,
@@ -61,6 +65,12 @@ pub async fn put_bucket(
         .unwrap_or_default()
         .split('&')
         .any(|part| part == "policy" || part.starts_with("policy="));
+    let is_versioning = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "versioning" || part.starts_with("versioning="));
     let header_map = request.headers().clone();
     let signature = match VerifiedRequest::from_request(request, &state).await {
         Ok(signature) => signature,
@@ -96,9 +106,63 @@ pub async fn put_bucket(
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    if is_versioning {
+        if !state
+            .opendal_operator
+            .exists(&format!("{}/{}/", signature.namespace, bucket_name))
+            .await
+            .unwrap_or(false)
+        {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist.",
+            );
+        }
+        let configuration: VersioningConfiguration =
+            match quick_xml::de::from_reader(signature.bytes.as_ref()) {
+                Ok(configuration) => configuration,
+                Err(_) => {
+                    return s3_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "MalformedXML",
+                        "The XML you provided was not well-formed.",
+                    )
+                }
+            };
+        let Some(status) =
+            crate::versioning::BucketVersioning::parse_s3_status(&configuration.status)
+        else {
+            return s3_error_response(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "The versioning status must be Enabled or Suspended.",
+            );
+        };
+        if let Err(error) = crate::versioning::set_bucket_versioning(
+            &state.opendal_operator,
+            &signature.namespace,
+            &bucket_name,
+            status,
+        )
+        .await
+        {
+            tracing::error!(%error, "failed to set bucket versioning");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        return StatusCode::OK.into_response();
+    }
+
     create_bucket_inner(bucket_name, header_map, state, signature)
         .await
         .map_or_else(IntoResponse::into_response, |response| response)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename = "VersioningConfiguration")]
+struct VersioningConfiguration {
+    #[serde(rename = "Status")]
+    status: String,
 }
 
 async fn create_bucket_inner(
@@ -183,7 +247,7 @@ pub async fn delete_bucket_route(
         .map_or_else(IntoResponse::into_response, |response| response)
 }
 
-async fn delete_bucket_inner(
+pub(crate) async fn delete_bucket_inner(
     bucket_name: String,
     AppState {
         metadata_store,
@@ -211,5 +275,6 @@ async fn delete_bucket_inner(
     metadata_store
         .delete_bucket_policy(&namespace, &bucket_name)
         .await?;
+    crate::versioning::delete_bucket_state(&opendal_operator, &namespace, &bucket_name).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

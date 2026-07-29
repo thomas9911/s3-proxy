@@ -3,6 +3,7 @@ use askama_web::WebTemplate;
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
 use serde::Deserialize;
+use serde::Serialize;
 use std::borrow::Cow;
 
 pub(crate) fn xml_response<T: Template>(status: StatusCode, template: T) -> Response<Body> {
@@ -22,6 +23,118 @@ pub struct ErrorTemplate<'a> {
 }
 
 #[derive(Debug, Template)]
+#[template(path = "management_dashboard.html")]
+pub struct ManagementDashboardTemplate<'a> {
+    pub principals: &'a [ManagementPrincipal],
+    pub buckets: &'a [ManagementBucket],
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementStatusTemplate {
+    pub metadata_ready: bool,
+    pub storage_ready: bool,
+    pub metadata_backend: String,
+    pub opendal_provider: String,
+    pub storage_capabilities: Vec<String>,
+    pub metrics: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementAccessKey {
+    pub id: String,
+    pub status: String,
+    pub created_at: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementPrincipal {
+    pub namespace: String,
+    pub display_name: String,
+    pub id: String,
+    pub access_keys: Vec<ManagementAccessKey>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementBucket {
+    pub namespace: String,
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementObject {
+    pub key: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementInspection {
+    pub namespace: String,
+    pub bucket: String,
+    pub key: Option<String>,
+    pub bucket_public: bool,
+    pub object_public: Option<bool>,
+    pub bucket_policy: Option<String>,
+    pub versioning: String,
+    pub metadata: Vec<ManagementMetadata>,
+    pub versions: Vec<ManagementVersion>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementMetadata {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementVersion {
+    pub id: String,
+    pub created_at: String,
+    pub delete_marker: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ManagementMultipartUpload {
+    pub namespace: String,
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "management_status.html")]
+pub struct ManagementStatusFragmentTemplate {
+    pub status: ManagementStatusTemplate,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "management_principals.html")]
+pub struct ManagementPrincipalsFragmentTemplate<'a> {
+    pub principals: &'a [ManagementPrincipal],
+}
+
+#[derive(Debug, Template)]
+#[template(path = "management_buckets.html")]
+pub struct ManagementBucketsFragmentTemplate<'a> {
+    pub buckets: &'a [ManagementBucket],
+}
+
+#[derive(Debug, Template)]
+#[template(path = "management_objects.html")]
+pub struct ManagementObjectsFragmentTemplate<'a> {
+    pub namespace: &'a str,
+    pub bucket: &'a str,
+    pub objects: &'a [ManagementObject],
+}
+
+#[derive(Debug, Template)]
+#[template(path = "management_inspection.html")]
+pub struct ManagementInspectionFragmentTemplate<'a> {
+    pub inspection: &'a ManagementInspection,
+}
+
+#[derive(Debug, Template)]
 #[template(path = "create_access_key.xml")]
 pub struct CreateAccessKeyTemplate<'a> {
     pub access_key: &'a str,
@@ -33,6 +146,55 @@ pub struct CreateAccessKeyTemplate<'a> {
 #[derive(Debug, Template)]
 #[template(path = "delete_access_key.xml")]
 pub struct DeleteAccessKeyTemplate;
+
+#[derive(Debug)]
+pub struct AccessKeyListItem<'a> {
+    pub id: &'a str,
+    pub status: &'a str,
+    pub created_at: Option<&'a str>,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "list_access_keys.xml")]
+pub struct ListAccessKeysTemplate<'a> {
+    pub user_name: &'a str,
+    pub access_keys: &'a [AccessKeyListItem<'a>],
+}
+
+#[derive(Debug, Template)]
+#[template(path = "update_access_key.xml")]
+pub struct UpdateAccessKeyTemplate;
+
+#[derive(Debug, Template)]
+#[template(path = "get_access_key_last_used.xml")]
+pub struct GetAccessKeyLastUsedTemplate<'a> {
+    pub user_name: &'a str,
+    pub access_key: &'a str,
+    pub last_used_at: Option<&'a str>,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "get_bucket_versioning.xml")]
+pub struct GetBucketVersioningTemplate<'a> {
+    pub status: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub struct ListVersionItem {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub last_modified: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "list_object_versions.xml")]
+pub struct ListObjectVersionsTemplate<'a> {
+    pub bucket_name: &'a str,
+    pub versions: &'a [ListVersionItem],
+    pub delete_markers: &'a [ListVersionItem],
+}
 
 #[derive(Debug, Template)]
 #[template(path = "initiate_multipart.xml")]

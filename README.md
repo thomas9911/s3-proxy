@@ -24,12 +24,17 @@ Double underscores separate nested fields.
 | --- | --- | --- |
 | `S3_PROXY__SERVER_HOST` | Address and port for the HTTP server | `0.0.0.0:3000` |
 | `S3_PROXY__EXTERNAL_SERVER_HOST` | Public URL used when generating URLs | `http://0.0.0.0:3000` |
+| `S3_PROXY__MAX_REQUEST_BODY_BYTES` | Maximum size of a single HTTP request body | `268435456` (256 MiB) |
 | `S3_PROXY__METADATA_BACKEND` | Metadata backend: `redis`, `sqlite`, or `postgres` | `sqlite` |
 | `S3_PROXY__REDIS__URL` | Redis connection URL when using Redis metadata | Required for Redis |
 | `S3_PROXY__SQLITE__URL` | SQLite URL when using SQLite metadata | `sqlite::memory:` |
 | `S3_PROXY__POSTGRES__URL` | PostgreSQL URL when using PostgreSQL metadata | Required for PostgreSQL |
 | `S3_PROXY__ADMIN__ACCESS_KEY` | Initial S3 access key to seed | Optional |
 | `S3_PROXY__ADMIN__SECRET_KEY` | Initial S3 secret key to seed | Optional |
+| `S3_PROXY__MANAGEMENT__USERNAME` | HTTP Basic username for the management dashboard | Disabled unless both management variables are set |
+| `S3_PROXY__MANAGEMENT__PASSWORD` | HTTP Basic password for the management dashboard | Disabled unless both management variables are set |
+| `S3_PROXY__QUOTAS__MAX_STORAGE_BYTES` | Maximum retained storage per principal, including object versions | Unlimited |
+| `S3_PROXY__QUOTAS__MAX_REQUESTS_PER_MINUTE` | Maximum authenticated requests per principal per minute | Unlimited |
 | `S3_PROXY__OPENDAL_PROVIDER` | OpenDAL service name, such as `s3`, `fs`, `memory`, or `sled` | `memory` |
 | `S3_PROXY__OPENDAL__*` | Options passed to the selected OpenDAL service | Service-dependent |
 
@@ -42,6 +47,17 @@ For example, an S3 service can be configured with
 
 Set both admin variables to create the initial credential on startup. Existing
 credentials are not overwritten.
+
+## Operations
+
+`GET /healthz` reports process health, `GET /readyz` verifies the metadata and
+OpenDAL services, and `GET /metrics` exposes Prometheus text metrics. Requests
+and authenticated principal activity are emitted as structured `tracing` audit
+events.
+
+Set both management variables to enable the separately authenticated dashboard
+at `GET /admin`. Its JSON API is available below `/admin/api/` and lists
+principals and sanitized access-key state; it never exposes secret keys.
 
 metadata:
 - sqlite (in-memory by default)

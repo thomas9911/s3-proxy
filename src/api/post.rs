@@ -1,6 +1,9 @@
 use crate::signature::s3_error_response;
 use crate::signature::VerifiedRequest;
-use crate::{metadata::ObjectMetadata, templates, AppState};
+use crate::{
+    metadata::{AccessKeyStatus, ObjectMetadata},
+    templates, AppState,
+};
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
 use axum::body::Body;
 use axum::extract::{FromRequest, Multipart, Path, Request, State};
@@ -88,6 +91,7 @@ pub async fn initiate_multipart(
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
     if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
@@ -113,6 +117,10 @@ pub async fn initiate_multipart(
     let manifest = MultipartManifest {
         bucket: bucket_name.clone(),
         object: object_name.clone(),
+        created_at: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_secs(),
     };
     opendal_operator
         .write(
@@ -138,6 +146,7 @@ pub async fn upload_part(
     upload_id: String,
     part_number: u32,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     if !(1..=10_000).contains(&part_number) || !valid_upload_id(&upload_id) {
         return Ok(s3_error_response(
             StatusCode::BAD_REQUEST,
@@ -188,6 +197,7 @@ pub async fn complete_multipart(
     signature: VerifiedRequest,
     upload_id: String,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     if !valid_upload_id(&upload_id) {
         return Ok(s3_error_response(
             StatusCode::BAD_REQUEST,
@@ -201,6 +211,7 @@ pub async fn complete_multipart(
     let AppState {
         opendal_operator,
         metadata_store,
+        config,
         ..
     } = state;
     let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
@@ -243,6 +254,43 @@ pub async fn complete_multipart(
         ));
     }
     let object_path = format!("{}/{}/{}", signature.namespace, bucket_name, object_name);
+    let mut expected_length = 0u64;
+    for part in &parts {
+        let path = multipart_part_path(&signature.namespace, &upload_id, part.part_number);
+        expected_length += match opendal_operator.stat(&path).await {
+            Ok(metadata) => metadata.content_length(),
+            Err(_) => {
+                return Ok(s3_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidPart",
+                    "One or more parts are missing.",
+                ))
+            }
+        };
+    }
+    if !crate::quota::allows_storage(
+        &config.quotas,
+        &opendal_operator,
+        &signature.namespace,
+        Some(&object_path),
+        expected_length,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "QuotaExceeded",
+            "The storage quota for this principal would be exceeded.",
+        ));
+    }
+    crate::versioning::prepare_overwrite(
+        &opendal_operator,
+        &signature.namespace,
+        &bucket_name,
+        &object_name,
+        &object_path,
+    )
+    .await?;
     let mut writer = opendal_operator.writer(&object_path).await?;
     let mut content_length = 0u64;
     for part in &parts {
@@ -310,20 +358,34 @@ pub async fn complete_multipart(
         )
     })
     .await?;
+    let version_id = crate::versioning::record_put(
+        &opendal_operator,
+        &signature.namespace,
+        &bucket_name,
+        &object_name,
+        &object_path,
+    )
+    .await?;
     let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
     opendal_operator
         .delete_with(&prefix)
         .recursive(true)
         .await?;
     let location = format!("/{bucket_name}/{object_name}");
-    Ok(templates::xml_response(
+    let mut response = templates::xml_response(
         StatusCode::OK,
         templates::CompleteMultipartTemplate {
             location: &location,
             bucket: &bucket_name,
             key: &object_name,
         },
-    ))
+    );
+    if let Some(version_id) = version_id {
+        response
+            .headers_mut()
+            .insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+    }
+    Ok(response)
 }
 
 pub async fn abort_multipart(
@@ -450,6 +512,8 @@ struct CompletedPart {
 struct MultipartManifest {
     bucket: String,
     object: String,
+    #[serde(default)]
+    created_at: u64,
 }
 
 fn query_value(query: Option<&str>, key: &str) -> Option<String> {
@@ -496,6 +560,7 @@ pub async fn post_object(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     mut multipart: Multipart,
@@ -536,16 +601,31 @@ pub async fn post_object(
         ));
     }
 
-    let secret_key = metadata_store.secret_key(access_key).await?;
-    let Some(secret_key) = secret_key else {
+    let access_key_record = metadata_store.access_key(access_key).await?;
+    let Some(access_key_record) = access_key_record else {
         return Ok(s3_error_response(
             StatusCode::FORBIDDEN,
             "AccessDenied",
             "Access Denied",
         ));
     };
+    if access_key_record.status != AccessKeyStatus::Active {
+        return Ok(s3_error_response(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "Access Denied",
+        ));
+    }
+    let namespace = access_key_record.principal_id;
+    if !crate::quota::allow_request(&config.quotas, &namespace) {
+        return Ok(s3_error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SlowDown",
+            "The request quota for this principal has been exceeded.",
+        ));
+    }
     if !opendal_operator
-        .exists(&format!("{access_key}/{bucket_name}/"))
+        .exists(&format!("{namespace}/{bucket_name}/"))
         .await?
     {
         return Ok(s3_error_response(
@@ -590,7 +670,7 @@ pub async fn post_object(
         }
     };
     let expected = calculate_signature(
-        generate_signing_key(&secret_key, signing_time, region, service),
+        generate_signing_key(&access_key_record.secret_key, signing_time, region, service),
         policy.as_bytes(),
     );
     if expected != *signature {
@@ -671,18 +751,42 @@ pub async fn post_object(
     };
     let content_length = file.len() as u64;
     let content_type = fields.get("content-type").cloned();
-    let filepath = format!("{access_key}/{bucket_name}/{key}");
+    metadata_store.record_access_key_use(access_key).await?;
+    let filepath = format!("{namespace}/{bucket_name}/{key}");
+    if !crate::quota::allows_storage(
+        &config.quotas,
+        &opendal_operator,
+        &namespace,
+        Some(&filepath),
+        content_length,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "QuotaExceeded",
+            "The storage quota for this principal would be exceeded.",
+        ));
+    }
+    crate::versioning::prepare_overwrite(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &key,
+        &filepath,
+    )
+    .await?;
     let mut writer = opendal_operator.write_with(&filepath, file);
     if let Some(content_type) = content_type.as_deref() {
         writer = writer.content_type(content_type);
     }
     writer.await?;
     crate::retry::retry("replace_presigned_post_metadata", || {
-        metadata_store.delete_object_metadata(access_key, &bucket_name, &key)
+        metadata_store.delete_object_metadata(&namespace, &bucket_name, &key)
     })
     .await?;
     crate::retry::retry("reset_presigned_post_public_acl", || {
-        metadata_store.set_object_public(access_key, &bucket_name, &key, false)
+        metadata_store.set_object_public(&namespace, &bucket_name, &key, false)
     })
     .await?;
     let user_metadata = fields
@@ -694,7 +798,7 @@ pub async fn post_object(
         .collect();
     metadata_store
         .set_object_metadata(
-            access_key,
+            &namespace,
             &bucket_name,
             &key,
             &ObjectMetadata {
@@ -706,7 +810,16 @@ pub async fn post_object(
             },
         )
         .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let version_id =
+        crate::versioning::record_put(&opendal_operator, &namespace, &bucket_name, &key, &filepath)
+            .await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Some(version_id) = version_id {
+        response
+            .headers_mut()
+            .insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+    }
+    Ok(response)
 }
 
 async fn delete_objects(
@@ -858,6 +971,9 @@ async fn delete_batch(
     .await
     .map_err(|error| delete_error(String::new(), error))?;
     for object in &object_names {
+        crate::versioning::record_delete_marker(opendal_operator, namespace, bucket_name, object)
+            .await
+            .map_err(|error| delete_error((*object).to_string(), error))?;
         crate::retry::retry("delete_object_public_acl", || {
             metadata_store.set_object_public(namespace, bucket_name, object, false)
         })
@@ -1041,6 +1157,7 @@ mod tests {
         let config = Config {
             server_host: "127.0.0.1:0".to_string(),
             external_server_host: "http://127.0.0.1:0".to_string(),
+            max_request_body_bytes: 256 * 1024 * 1024,
             metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
             redis: None,
             sqlite: Some(SqliteConfig {
@@ -1048,6 +1165,8 @@ mod tests {
             }),
             postgres: None,
             admin: None,
+            management: None,
+            quotas: crate::quota::QuotaConfig::default(),
             opendal_provider: "memory".to_string(),
             opendal: HashMap::new(),
         };
@@ -1094,6 +1213,7 @@ mod tests {
                 serde_json::to_vec(&MultipartManifest {
                     bucket: "bucket".to_string(),
                     object: "object.txt".to_string(),
+                    created_at: 0,
                 })
                 .unwrap(),
             )
@@ -1207,6 +1327,7 @@ mod tests {
                 serde_json::to_vec(&MultipartManifest {
                     bucket: "bucket".to_string(),
                     object: "aborted.txt".to_string(),
+                    created_at: 0,
                 })
                 .unwrap(),
             )

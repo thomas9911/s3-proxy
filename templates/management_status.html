@@ -1,0 +1,3 @@
+<section><strong>Metadata</strong><p>{{ status.metadata_backend }}</p><p class="{% if status.metadata_ready %}ok{% else %}bad{% endif %}">{% if status.metadata_ready %}Ready{% else %}Unavailable{% endif %}</p></section>
+<section><strong>Storage</strong><p>{{ status.opendal_provider }}</p><p class="{% if status.storage_ready %}ok{% else %}bad{% endif %}">{% if status.storage_ready %}Ready{% else %}Unavailable{% endif %}</p><p>Capabilities: {% for capability in status.storage_capabilities %}<code>{{ capability }}</code>{% if !loop.last %}, {% endif %}{% endfor %}</p></section>
+<section class="metrics"><strong>Metrics</strong><pre>{{ status.metrics }}</pre></section>

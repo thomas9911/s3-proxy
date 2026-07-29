@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{templates, AppState};
+use crate::{metadata::AccessKeyStatus, templates, AppState};
 use axum::extract::{FromRequest, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -36,15 +36,178 @@ pub async fn create_access_key(State(state): State<AppState>, request: Request) 
 
     match parameters.get("Action").map(String::as_str) {
         Some("CreateAccessKey") => {
-            create_access_key_response(&state, &signature.access_key, &parameters).await
+            create_access_key_response(&state, &signature.namespace, &parameters).await
         }
         Some("DeleteAccessKey") => delete_access_key(&state, &parameters).await,
+        Some("ListAccessKeys") => list_access_keys(&state, &signature.namespace, &parameters).await,
+        Some("UpdateAccessKey") => update_access_key(&state, &parameters).await,
+        Some("GetAccessKeyLastUsed") => get_access_key_last_used(&state, &parameters).await,
         _ => s3_error_response(
             StatusCode::BAD_REQUEST,
             "InvalidAction",
             "The action is not supported.",
         ),
     }
+}
+
+async fn list_access_keys(
+    state: &AppState,
+    caller_principal: &str,
+    parameters: &HashMap<String, String>,
+) -> Response {
+    let principal_id = parameters
+        .get("UserName")
+        .map(String::as_str)
+        .unwrap_or(caller_principal);
+    if !valid_user_name(principal_id) {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "The UserName parameter is invalid.",
+        );
+    }
+    let owner = match state.metadata_store.namespace_owner(principal_id).await {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::error!(%error, "failed to look up principal");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let access_keys = match state.metadata_store.list_access_keys(principal_id).await {
+        Ok(access_keys) => access_keys,
+        Err(error) => {
+            tracing::error!(%error, "failed to list access keys");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let items = access_keys
+        .iter()
+        .map(|access_key| templates::AccessKeyListItem {
+            id: &access_key.id,
+            status: access_key.status.as_str(),
+            created_at: access_key.created_at.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    templates::xml_response(
+        StatusCode::OK,
+        templates::ListAccessKeysTemplate {
+            user_name: &owner.display_name,
+            access_keys: &items,
+        },
+    )
+}
+
+async fn update_access_key(state: &AppState, parameters: &HashMap<String, String>) -> Response {
+    let Some(access_key) = parameters.get("AccessKeyId") else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "The AccessKeyId parameter is required.",
+        );
+    };
+    let Some(status) = parameters
+        .get("Status")
+        .and_then(|status| match status.as_str() {
+            "Active" => Some(AccessKeyStatus::Active),
+            "Inactive" => Some(AccessKeyStatus::Inactive),
+            _ => None,
+        })
+    else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "The Status parameter must be Active or Inactive.",
+        );
+    };
+    let Some(record) = access_key_for_request(state, access_key, parameters).await else {
+        return no_such_access_key();
+    };
+    match state
+        .metadata_store
+        .set_access_key_status(&record.id, status)
+        .await
+    {
+        Ok(true) => templates::xml_response(StatusCode::OK, templates::UpdateAccessKeyTemplate),
+        Ok(false) => no_such_access_key(),
+        Err(error) => {
+            tracing::error!(%error, "failed to update access key");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn get_access_key_last_used(
+    state: &AppState,
+    parameters: &HashMap<String, String>,
+) -> Response {
+    let Some(access_key) = parameters.get("AccessKeyId") else {
+        return s3_error_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "The AccessKeyId parameter is required.",
+        );
+    };
+    let Some(record) = access_key_for_request(state, access_key, parameters).await else {
+        return no_such_access_key();
+    };
+    let owner = match state
+        .metadata_store
+        .namespace_owner(&record.principal_id)
+        .await
+    {
+        Ok(owner) => owner,
+        Err(error) => {
+            tracing::error!(%error, "failed to look up access key owner");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    templates::xml_response(
+        StatusCode::OK,
+        templates::GetAccessKeyLastUsedTemplate {
+            user_name: &owner.display_name,
+            access_key: &record.id,
+            last_used_at: record.last_used_at.as_deref(),
+        },
+    )
+}
+
+async fn access_key_for_request(
+    state: &AppState,
+    access_key: &str,
+    parameters: &HashMap<String, String>,
+) -> Option<crate::metadata::AccessKey> {
+    if !valid_access_key_id(access_key) {
+        return None;
+    }
+    let record = match state.metadata_store.access_key(access_key).await {
+        Ok(record) => record?,
+        Err(error) => {
+            tracing::error!(%error, "failed to look up access key");
+            return None;
+        }
+    };
+    if let Some(user_name) = parameters.get("UserName") {
+        if !valid_user_name(user_name) {
+            return None;
+        }
+        let owner = state
+            .metadata_store
+            .namespace_owner(&record.principal_id)
+            .await
+            .ok()?;
+        if owner.display_name != *user_name {
+            return None;
+        }
+    }
+    Some(record)
+}
+
+fn no_such_access_key() -> Response {
+    s3_error_response(
+        StatusCode::NOT_FOUND,
+        "NoSuchEntity",
+        "The access key does not exist.",
+    )
 }
 
 async fn create_access_key_response(
@@ -86,10 +249,7 @@ async fn create_access_key_response(
     )
 }
 
-async fn delete_access_key(
-    state: &AppState,
-    parameters: &HashMap<String, String>,
-) -> Response {
+async fn delete_access_key(state: &AppState, parameters: &HashMap<String, String>) -> Response {
     let Some(access_key) = parameters.get("AccessKeyId") else {
         return s3_error_response(
             StatusCode::BAD_REQUEST,
@@ -104,21 +264,20 @@ async fn delete_access_key(
             "The AccessKeyId parameter is invalid.",
         );
     }
-    let exists = match state.metadata_store.secret_key(access_key).await {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
+    let record = match state.metadata_store.access_key(access_key).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                "The access key does not exist.",
+            )
+        }
         Err(error) => {
             tracing::error!(%error, "failed to look up access key");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    if !exists {
-        return s3_error_response(
-            StatusCode::NOT_FOUND,
-            "NoSuchEntity",
-            "The access key does not exist.",
-        );
-    }
     if let Some(user_name) = parameters.get("UserName") {
         if !valid_user_name(user_name) {
             return s3_error_response(
@@ -127,7 +286,11 @@ async fn delete_access_key(
                 "The UserName parameter is invalid.",
             );
         }
-        let owner = match state.metadata_store.namespace_owner(access_key).await {
+        let owner = match state
+            .metadata_store
+            .namespace_owner(&record.principal_id)
+            .await
+        {
             Ok(owner) => owner,
             Err(error) => {
                 tracing::error!(%error, "failed to look up access key owner");
@@ -166,7 +329,7 @@ async fn create_unique_access_key(
             base64::engine::general_purpose::STANDARD_NO_PAD.encode(random::<[u8; 30]>());
         if state
             .metadata_store
-            .create_access_key(&access_key, &secret_key)
+            .create_access_key(&access_key, &secret_key, user_name)
             .await?
         {
             state

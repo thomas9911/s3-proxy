@@ -16,6 +16,16 @@ pub enum MetaDataBackend {
     Postgres,
 }
 
+impl MetaDataBackend {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Redis => "redis",
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
 pub(crate) struct OperationTimer {
     operation: &'static str,
     started: Instant,
@@ -23,9 +33,11 @@ pub(crate) struct OperationTimer {
 
 impl Drop for OperationTimer {
     fn drop(&mut self) {
+        let elapsed_us = self.started.elapsed().as_micros() as u64;
+        crate::metrics::record_metadata(elapsed_us);
         tracing::debug!(
             operation = self.operation,
-            elapsed_us = self.started.elapsed().as_micros() as u64,
+            elapsed_us,
             "metadata operation completed"
         );
     }
@@ -51,6 +63,38 @@ pub struct ObjectMetadata {
 pub struct NamespaceOwner {
     pub display_name: String,
     pub id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccessKey {
+    pub id: String,
+    pub principal_id: String,
+    pub status: AccessKeyStatus,
+    pub secret_key: String,
+    pub created_at: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessKeyStatus {
+    Active,
+    Inactive,
+}
+
+impl AccessKeyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Inactive => "Inactive",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "Inactive" => Self::Inactive,
+            _ => Self::Active,
+        }
+    }
 }
 
 impl ObjectMetadata {
@@ -91,9 +135,26 @@ impl ObjectMetadata {
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
-    async fn create_access_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<bool>;
+    async fn create_access_key(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        principal_id: &str,
+    ) -> anyhow::Result<bool>;
 
     async fn delete_access_key(&self, access_key: &str) -> anyhow::Result<bool>;
+
+    async fn access_key(&self, access_key: &str) -> anyhow::Result<Option<AccessKey>>;
+
+    async fn list_access_keys(&self, principal_id: &str) -> anyhow::Result<Vec<AccessKey>>;
+
+    async fn set_access_key_status(
+        &self,
+        access_key: &str,
+        status: AccessKeyStatus,
+    ) -> anyhow::Result<bool>;
+
+    async fn record_access_key_use(&self, access_key: &str) -> anyhow::Result<()>;
 
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()>;
 
@@ -107,6 +168,8 @@ pub trait MetadataStore: Send + Sync {
     ) -> anyhow::Result<()>;
 
     async fn namespace_owner(&self, namespace: &str) -> anyhow::Result<NamespaceOwner>;
+
+    async fn list_namespace_owners(&self) -> anyhow::Result<Vec<(String, NamespaceOwner)>>;
 
     async fn set_object_metadata(
         &self,

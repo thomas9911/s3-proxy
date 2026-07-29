@@ -18,10 +18,12 @@ pub async fn create_object(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     let namespace = signature.namespace;
 
     if !opendal_operator
@@ -37,6 +39,29 @@ pub async fn create_object(
 
     let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
     let content_length = signature.bytes.len() as u64;
+    if !crate::quota::allows_storage(
+        &config.quotas,
+        &opendal_operator,
+        &namespace,
+        Some(&filepath),
+        content_length,
+    )
+    .await?
+    {
+        return Ok(s3_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "QuotaExceeded",
+            "The storage quota for this principal would be exceeded.",
+        ));
+    }
+    crate::versioning::prepare_overwrite(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        &filepath,
+    )
+    .await?;
     let content_type = header_map
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -108,7 +133,21 @@ pub async fn create_object(
         }
     }
 
-    Ok("OK".into_response())
+    let version_id = crate::versioning::record_put(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        &filepath,
+    )
+    .await?;
+    let mut response = StatusCode::OK.into_response();
+    if let Some(version_id) = version_id {
+        response
+            .headers_mut()
+            .insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+    }
+    Ok(response)
 }
 
 pub async fn put_object(
@@ -151,7 +190,7 @@ pub async fn put_object(
             &bucket_name,
             &object_name,
             "s3:PutObject",
-            &verified.access_key,
+            &verified.namespace,
             &verified.namespace,
         )
         .await
@@ -212,6 +251,7 @@ async fn copy_object(
     let AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     } = state;
     let namespace = signature.namespace;
@@ -235,6 +275,41 @@ async fn copy_object(
             "NoSuchKey",
             "The specified key does not exist.",
         );
+    }
+    let source_size = match opendal_operator.stat(&from).await {
+        Ok(metadata) => metadata.content_length(),
+        Err(error) => {
+            tracing::error!(%error, "failed to stat copy source");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if !crate::quota::allows_storage(
+        &config.quotas,
+        &opendal_operator,
+        &namespace,
+        Some(&to),
+        source_size,
+    )
+    .await
+    .unwrap_or(false)
+    {
+        return s3_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "QuotaExceeded",
+            "The storage quota for this principal would be exceeded.",
+        );
+    }
+    if let Err(error) = crate::versioning::prepare_overwrite(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        &to,
+    )
+    .await
+    {
+        tracing::error!(%error, "failed to prepare copied object version");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     if let Err(error) = opendal_operator.copy(&from, &to).await {
         tracing::debug!(%error, "native copy unavailable, falling back to read/write");
@@ -287,7 +362,31 @@ async fn copy_object(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
-    templates::xml_response(StatusCode::OK, templates::CopyObjectTemplate)
+    let version_id = match crate::versioning::record_put(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        &to,
+    )
+    .await
+    {
+        Ok(version_id) => version_id,
+        Err(error) => {
+            tracing::error!(%error, "failed to store copied object version");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut response = templates::xml_response(StatusCode::OK, templates::CopyObjectTemplate);
+    if let Some(version_id) = version_id {
+        let Ok(version_id) = HeaderValue::from_str(&version_id) else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        response
+            .headers_mut()
+            .insert("x-amz-version-id", version_id);
+    }
+    response
 }
 
 pub async fn get_object(
@@ -295,6 +394,7 @@ pub async fn get_object(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     if let Some(upload_id) = query_value(request.uri().query(), "uploadId") {
         let verified = match VerifiedRequest::from_request(request, &state).await {
             Ok(verified) => verified,
@@ -303,6 +403,7 @@ pub async fn get_object(
         return super::post::list_parts(bucket_name, object_name, state, verified, upload_id).await;
     }
     let range_header = request.headers().get(RANGE).cloned();
+    let version_id = query_value(request.uri().query(), "versionId");
     let namespace = match resolve_read_namespace(request, &state, &bucket_name, &object_name).await
     {
         Ok(namespace) => namespace,
@@ -325,7 +426,42 @@ pub async fn get_object(
         ));
     }
 
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let (filepath, selected_version_id) = match crate::versioning::version(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        version_id.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(version)) if version.is_delete_marker => {
+            return Ok(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The specified key does not exist.",
+            ))
+        }
+        Ok(Some(version)) => (
+            version.data_path.expect("non-marker version has data"),
+            Some(version.version_id),
+        ),
+        Ok(None) if version_id.is_some() => {
+            return Ok(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "The specified version does not exist.",
+            ))
+        }
+        Ok(None) => (
+            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve object version");
+            return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
     let metadata = if let Ok(metadata) = opendal_operator.stat(&filepath).await {
         if !metadata.is_file() {
             return Ok(s3_error_response(
@@ -358,6 +494,10 @@ pub async fn get_object(
     let reader = opendal_operator.reader(&filepath).await?;
 
     let mut response_headers = HeaderMap::new();
+
+    if let Some(version_id) = selected_version_id {
+        response_headers.insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+    }
 
     if let Some(content_type) = metadata
         .content_type()
@@ -461,6 +601,8 @@ pub async fn head_object(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
+    let version_id = query_value(request.uri().query(), "versionId");
     let namespace = match resolve_read_namespace(request, &state, &bucket_name, &object_name).await
     {
         Ok(namespace) => namespace,
@@ -480,7 +622,42 @@ pub async fn head_object(
         ));
     }
 
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let (filepath, selected_version_id) = match crate::versioning::version(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+        version_id.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(version)) if version.is_delete_marker => {
+            return Ok(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "The specified key does not exist.",
+            ))
+        }
+        Ok(Some(version)) => (
+            version.data_path.expect("non-marker version has data"),
+            Some(version.version_id),
+        ),
+        Ok(None) if version_id.is_some() => {
+            return Ok(s3_error_response(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "The specified version does not exist.",
+            ))
+        }
+        Ok(None) => (
+            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            None,
+        ),
+        Err(error) => {
+            tracing::error!(%error, "failed to resolve object version");
+            return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
     let metadata = match opendal_operator.stat(&filepath).await {
         Ok(metadata) if metadata.is_file() => metadata,
         Ok(_) | Err(_) => {
@@ -492,6 +669,9 @@ pub async fn head_object(
         }
     };
     let mut headers = HeaderMap::new();
+    if let Some(version_id) = selected_version_id {
+        headers.insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+    }
     headers.insert(
         CONTENT_LENGTH,
         HeaderValue::from_str(&metadata.content_length().to_string())?,
@@ -530,6 +710,7 @@ pub async fn delete_object(
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
+    crate::metrics::record_storage();
     let namespace = signature.namespace;
     if !opendal_operator
         .exists(&format!("{}/{}/", namespace, bucket_name))
@@ -552,7 +733,23 @@ pub async fn delete_object(
     metadata_store
         .set_object_public(&namespace, &bucket_name, &object_name, false)
         .await?;
-    Ok(StatusCode::NO_CONTENT.into_response())
+    let version_id = crate::versioning::record_delete_marker(
+        &opendal_operator,
+        &namespace,
+        &bucket_name,
+        &object_name,
+    )
+    .await?;
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    if let Some(version_id) = version_id {
+        response
+            .headers_mut()
+            .insert("x-amz-version-id", HeaderValue::from_str(&version_id)?);
+        response
+            .headers_mut()
+            .insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    }
+    Ok(response)
 }
 
 pub async fn delete_object_route(
@@ -592,7 +789,7 @@ pub async fn delete_object_route(
             &bucket_name,
             &object_name,
             "s3:DeleteObject",
-            &verified.access_key,
+            &verified.namespace,
             &verified.namespace,
         )
         .await
@@ -647,6 +844,7 @@ mod tests {
         let config = Config {
             server_host: "127.0.0.1:0".to_string(),
             external_server_host: "http://127.0.0.1:0".to_string(),
+            max_request_body_bytes: 256 * 1024 * 1024,
             metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
             redis: None,
             sqlite: Some(SqliteConfig {
@@ -654,6 +852,8 @@ mod tests {
             }),
             postgres: None,
             admin: None,
+            management: None,
+            quotas: crate::quota::QuotaConfig::default(),
             opendal_provider: "memory".to_string(),
             opendal: HashMap::new(),
         };
@@ -907,7 +1107,7 @@ async fn resolve_read_namespace(
         {
             match crate::policy::decision(
                 &policy,
-                Some(&verified.access_key),
+                Some(&verified.namespace),
                 "s3:GetObject",
                 &resource,
             )
