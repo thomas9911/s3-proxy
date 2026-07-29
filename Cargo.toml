@@ -53,6 +53,8 @@ opendal = {
     ],
 }
 quick-xml = { version = "0.41.0", features = ["serialize", "async-tokio"] }
+hex = "0.4.3"
+rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }

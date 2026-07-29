@@ -15,6 +15,33 @@ impl RedisMetadataStore {
 
 #[async_trait]
 impl MetadataStore for RedisMetadataStore {
+    async fn create_access_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<bool> {
+        let mut connection = self.pool.get().await?;
+        let created: bool = connection
+            .set_nx(format!("secret_key::{access_key}"), secret_key)
+            .await?;
+        if created {
+            let _: () = connection
+                .hset_multiple(
+                    namespace_owner_key(access_key),
+                    &[("display_name", access_key), ("owner_id", access_key)],
+                )
+                .await?;
+        }
+        Ok(created)
+    }
+
+    async fn delete_access_key(&self, access_key: &str) -> anyhow::Result<bool> {
+        let mut connection = self.pool.get().await?;
+        let deleted: i32 = connection.del(format!("secret_key::{access_key}")).await?;
+        if deleted == 1 {
+            let _: () = connection.del(namespace_owner_key(access_key)).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()> {
         let mut connection = self.pool.get().await?;
         let _: () = connection

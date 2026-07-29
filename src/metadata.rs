@@ -91,6 +91,10 @@ impl ObjectMetadata {
 
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
+    async fn create_access_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<bool>;
+
+    async fn delete_access_key(&self, access_key: &str) -> anyhow::Result<bool>;
+
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()>;
 
     async fn secret_key(&self, access_key: &str) -> anyhow::Result<Option<String>>;

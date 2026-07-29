@@ -22,6 +22,19 @@ pub struct ErrorTemplate<'a> {
 }
 
 #[derive(Debug, Template)]
+#[template(path = "create_access_key.xml")]
+pub struct CreateAccessKeyTemplate<'a> {
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    pub user_name: &'a str,
+    pub create_date: &'a str,
+}
+
+#[derive(Debug, Template)]
+#[template(path = "delete_access_key.xml")]
+pub struct DeleteAccessKeyTemplate;
+
+#[derive(Debug, Template)]
 #[template(path = "initiate_multipart.xml")]
 pub struct InitiateMultipartTemplate<'a> {
     pub bucket: &'a str,

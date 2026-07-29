@@ -146,7 +146,7 @@ impl AppState {
 pub fn build_app(app_state: AppState) -> Router {
     Router::new()
         .route("/_metadata", get(metadata_debug))
-        .route("/", get(api::list_buckets))
+        .route("/", get(api::list_buckets).post(api::create_access_key))
         .directory_route(
             "/{bucket_name}",
             get(api::get_bucket)

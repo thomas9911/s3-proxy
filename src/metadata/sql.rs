@@ -173,6 +173,51 @@ impl SqlMetadataStore {
 
 #[async_trait]
 impl MetadataStore for SqliteMetadataStore {
+    async fn create_access_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<bool> {
+        let query = format!(
+            "INSERT INTO access_keys (access_key, secret_key) VALUES ({}, {})
+             ON CONFLICT(access_key) DO NOTHING",
+            self.placeholder(1),
+            self.placeholder(2),
+        );
+        let result = sqlx::query(AssertSqlSafe(query))
+            .bind(access_key)
+            .bind(secret_key)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 1 {
+            self.set_namespace_owner(access_key, access_key, access_key)
+                .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn delete_access_key(&self, access_key: &str) -> anyhow::Result<bool> {
+        let query = format!(
+            "DELETE FROM access_keys WHERE access_key = {}",
+            self.placeholder(1),
+        );
+        let result = sqlx::query(AssertSqlSafe(query))
+            .bind(access_key)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 1 {
+            let owner_query = format!(
+                "DELETE FROM namespace_owners WHERE namespace = {}",
+                self.placeholder(1),
+            );
+            sqlx::query(AssertSqlSafe(owner_query))
+                .bind(access_key)
+                .execute(&self.pool)
+                .await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn set_secret_key(&self, access_key: &str, secret_key: &str) -> anyhow::Result<()> {
         let first = self.placeholder(1);
         let second = self.placeholder(2);

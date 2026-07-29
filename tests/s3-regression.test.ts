@@ -158,6 +158,54 @@ async function signedDelete(body: string, contentMd5?: string) {
 	});
 }
 
+async function signedIamAction(parameters: Record<string, string>) {
+	const targetUrl = new URL(endpoint);
+	const body = new URLSearchParams({
+		Version: "2010-05-08",
+		...parameters,
+	}).toString();
+	const amzDate = new Date()
+		.toISOString()
+		.replace(/[-:]/g, "")
+		.replace(/\.\d{3}Z$/, "Z");
+	const bodyHash = new Bun.CryptoHasher("sha256").update(body).digest("hex");
+	const request = new HttpRequest({
+		method: "POST",
+		protocol: targetUrl.protocol,
+		hostname: targetUrl.hostname,
+		port: targetUrl.port ? Number(targetUrl.port) : undefined,
+		path: targetUrl.pathname || "/",
+		headers: {
+			host: targetUrl.host,
+			"content-type": "application/x-www-form-urlencoded",
+			"x-amz-content-sha256": bodyHash,
+			"x-amz-date": amzDate,
+		},
+		body,
+	});
+	const signer = new SignatureV4({
+		credentials: { accessKeyId, secretAccessKey },
+		region,
+		service: "s3",
+		sha256: Sha256,
+		uriEscapePath: false,
+	});
+	const signed = await signer.sign(request);
+	return fetch(targetUrl, { method: "POST", headers: signed.headers, body });
+}
+
+function signedCreateAccessKey(userName: string) {
+	return signedIamAction({ Action: "CreateAccessKey", UserName: userName });
+}
+
+function signedDeleteAccessKey(accessKeyId: string, userName: string) {
+	return signedIamAction({
+		Action: "DeleteAccessKey",
+		AccessKeyId: accessKeyId,
+		UserName: userName,
+	});
+}
+
 async function waitForEndpoint() {
 	for (let attempt = 0; attempt < 60; attempt++) {
 		try {
@@ -272,10 +320,12 @@ async function startTarget() {
     const cargoRunArgs = ["cargo", "run", "--quiet"];
     cargoRunArgs.push("--release");
 		proxyProcess = Bun.spawn(cargoRunArgs, {
-			env: {
-				...process.env,
-				S3_PROXY__SERVER_HOST: "0.0.0.0:19000",
-				S3_PROXY__EXTERNAL_SERVER_HOST: endpoint,
+				env: {
+					...process.env,
+					S3_PROXY__SERVER_HOST: "0.0.0.0:19000",
+					S3_PROXY__EXTERNAL_SERVER_HOST: endpoint,
+					S3_PROXY__ADMIN__ACCESS_KEY: accessKeyId,
+					S3_PROXY__ADMIN__SECRET_KEY: secretAccessKey,
 				S3_PROXY__METADATA_BACKEND: metadataBackend,
 				...(metadataBackend === "redis"
 					? { S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379" }
@@ -463,6 +513,45 @@ describe("S3 compatibility contract", () => {
 		if (target === "proxy") {
 			const copiedAnonymous = await fetch(`${endpoint}/${bucket}/${copiedKey}`);
 			expect(copiedAnonymous.status).toBe(403);
+		}
+	});
+
+	test("creates access keys through the IAM API", async () => {
+		if (target !== "proxy") return;
+		const userName = `regression-user-${Date.now()}`;
+		const response = await signedCreateAccessKey(userName);
+		expect(response.status).toBe(200);
+		const xml = await response.text();
+		const createdAccessKey = xml.match(/<AccessKeyId>([^<]+)<\/AccessKeyId>/)?.[1];
+		const createdSecretKey = xml.match(/<SecretAccessKey>([^<]+)<\/SecretAccessKey>/)?.[1];
+		expect(createdAccessKey).toMatch(/^AKIA[0-9a-f]{16}$/);
+		expect(createdSecretKey).toMatch(/^[A-Za-z0-9+/]{40}$/);
+
+		const createdClient = new S3Client({
+			endpoint,
+			region,
+			forcePathStyle: true,
+			credentials: {
+				accessKeyId: createdAccessKey ?? "",
+				secretAccessKey: createdSecretKey ?? "",
+			},
+		});
+		try {
+			const buckets = await createdClient.send(new ListBucketsCommand({}));
+			expect(buckets.$metadata.httpStatusCode).toBe(200);
+			const deleteResponse = await signedDeleteAccessKey(
+				createdAccessKey ?? "",
+				userName,
+			);
+			expect(deleteResponse.status).toBe(200);
+			expect(await deleteResponse.text()).toContain("DeleteAccessKeyResponse");
+			await expectS3Error(
+				createdClient.send(new ListBucketsCommand({})),
+				403,
+				["AccessDenied"],
+			);
+		} finally {
+			createdClient.destroy();
 		}
 	});
 
