@@ -852,6 +852,7 @@ mod tests {
             }),
             postgres: None,
             admin: None,
+            #[cfg(feature = "management")]
             management: None,
             quotas: crate::quota::QuotaConfig::default(),
             opendal_provider: "memory".to_string(),

@@ -31,6 +31,7 @@ pub fn record(method: String, path: String, status: u16, elapsed_us: u64) {
     }
 }
 
+#[cfg(feature = "management")]
 pub fn recent(limit: usize) -> Vec<AuditEvent> {
     events()
         .lock()

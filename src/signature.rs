@@ -252,6 +252,7 @@ pub(crate) fn has_presigned_query(uri: &axum::http::Uri) -> bool {
     parse_presigned_query(uri).is_some()
 }
 
+#[cfg(feature = "management")]
 pub(crate) fn presign_get_url(
     external_host: &str,
     bucket: &str,

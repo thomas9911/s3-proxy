@@ -43,6 +43,7 @@ pub struct Config {
     pub postgres: Option<PostgresConfig>,
     #[serde(default)]
     pub admin: Option<AdminConfig>,
+    #[cfg(feature = "management")]
     #[serde(default)]
     pub management: Option<ManagementConfig>,
     #[serde(default)]
@@ -69,6 +70,7 @@ pub struct AdminConfig {
     pub secret_key: String,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, serde::Deserialize)]
 pub struct ManagementConfig {
     pub username: String,
@@ -177,81 +179,16 @@ impl AppState {
 
 pub fn build_app(app_state: AppState) -> Router {
     let max_request_body_bytes = app_state.config.max_request_body_bytes;
-    Router::new()
+    let router = Router::new()
         .route("/_metadata", get(metadata_debug))
         .route("/healthz", get(health))
         .route("/readyz", get(readiness))
-        .route("/metrics", get(metrics))
-        .route("/admin", get(api::management_dashboard))
-        .route("/admin/api/status", get(api::management_status))
-        .route("/admin/api/audit", get(api::management_audit))
-        .route("/admin/api/metrics", get(api::management_metrics))
-        .route("/admin/api/principals", get(api::management_principals))
-        .route(
-            "/admin/api/quotas",
-            get(api::management_quota).post(api::management_update_quota),
-        )
-        .route(
-            "/admin/api/access-keys",
-            axum::routing::post(api::management_create_access_key)
-                .patch(api::management_update_access_key)
-                .delete(api::management_delete_access_key),
-        )
-        .route(
-            "/admin/api/access-keys/rotate",
-            axum::routing::post(api::management_rotate_access_key),
-        )
-        .route(
-            "/admin/api/multipart-uploads",
-            get(api::management_list_multipart_uploads)
-                .delete(api::management_abort_multipart_upload),
-        )
-        .route(
-            "/admin/api/buckets",
-            get(api::management_buckets)
-                .post(api::management_create_bucket)
-                .delete(api::management_delete_bucket),
-        )
-        .route(
-            "/admin/api/bucket-configuration",
-            axum::routing::post(api::management_update_bucket_configuration),
-        )
-        .route(
-            "/admin/api/objects",
-            get(api::management_list_objects)
-                .post(api::management_upload_object)
-                .delete(api::management_delete_object),
-        )
-        .route(
-            "/admin/api/presigned-urls",
-            axum::routing::post(api::management_presign_object),
-        )
-        .route("/admin/api/download", get(api::management_download_object))
-        .route(
-            "/admin/api/presigned-posts",
-            axum::routing::post(api::management_presign_post),
-        )
-        .route("/admin/api/inspect", get(api::management_inspect))
-        .route(
-            "/admin/fragments/objects",
-            get(api::management_list_objects_fragment),
-        )
-        .route(
-            "/admin/fragments/inspect",
-            get(api::management_inspect_fragment),
-        )
-        .route(
-            "/admin/fragments/status",
-            get(api::management_status_fragment),
-        )
-        .route(
-            "/admin/fragments/principals",
-            get(api::management_principals_fragment),
-        )
-        .route(
-            "/admin/fragments/buckets",
-            get(api::management_buckets_fragment).post(api::management_create_bucket_fragment),
-        )
+        .route("/metrics", get(metrics));
+
+    #[cfg(feature = "management")]
+    let router = router.merge(management_router());
+
+    router
         .route("/", get(api::list_buckets).post(api::create_access_key))
         .directory_route(
             "/{bucket_name}",
@@ -280,6 +217,81 @@ pub fn build_app(app_state: AppState) -> Router {
             )
         })
         .with_state(app_state)
+}
+
+#[cfg(feature = "management")]
+fn management_router() -> Router<AppState> {
+    Router::new()
+        .route("/admin", get(api::management_dashboard))
+        .nest("/admin/api", management_api_router())
+        .nest("/admin/fragments", management_fragments_router())
+}
+
+#[cfg(feature = "management")]
+fn management_api_router() -> Router<AppState> {
+    Router::new()
+        .route("/status", get(api::management_status))
+        .route("/audit", get(api::management_audit))
+        .route("/metrics", get(api::management_metrics))
+        .route("/principals", get(api::management_principals))
+        .route(
+            "/quotas",
+            get(api::management_quota).post(api::management_update_quota),
+        )
+        .route(
+            "/access-keys",
+            axum::routing::post(api::management_create_access_key)
+                .patch(api::management_update_access_key)
+                .delete(api::management_delete_access_key),
+        )
+        .route(
+            "/access-keys/rotate",
+            axum::routing::post(api::management_rotate_access_key),
+        )
+        .route(
+            "/multipart-uploads",
+            get(api::management_list_multipart_uploads)
+                .delete(api::management_abort_multipart_upload),
+        )
+        .route(
+            "/buckets",
+            get(api::management_buckets)
+                .post(api::management_create_bucket)
+                .delete(api::management_delete_bucket),
+        )
+        .route(
+            "/bucket-configuration",
+            axum::routing::post(api::management_update_bucket_configuration),
+        )
+        .route(
+            "/objects",
+            get(api::management_list_objects)
+                .post(api::management_upload_object)
+                .delete(api::management_delete_object),
+        )
+        .route(
+            "/presigned-urls",
+            axum::routing::post(api::management_presign_object),
+        )
+        .route("/download", get(api::management_download_object))
+        .route(
+            "/presigned-posts",
+            axum::routing::post(api::management_presign_post),
+        )
+        .route("/inspect", get(api::management_inspect))
+}
+
+#[cfg(feature = "management")]
+fn management_fragments_router() -> Router<AppState> {
+    Router::new()
+        .route("/objects", get(api::management_list_objects_fragment))
+        .route("/inspect", get(api::management_inspect_fragment))
+        .route("/status", get(api::management_status_fragment))
+        .route("/principals", get(api::management_principals_fragment))
+        .route(
+            "/buckets",
+            get(api::management_buckets_fragment).post(api::management_create_bucket_fragment),
+        )
 }
 
 async fn health() -> impl IntoResponse {

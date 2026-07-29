@@ -17,6 +17,16 @@ dependency path is available.
 
 ## Environment variables
 
+## Cargo features
+
+The management dashboard is enabled by default through the `management` Cargo
+feature. Build without it to exclude the `/admin` routes, management handlers,
+and management Askama templates:
+
+```text
+cargo build --release --no-default-features
+```
+
 Configuration is read from environment variables with the `S3_PROXY__` prefix.
 Double underscores separate nested fields.
 

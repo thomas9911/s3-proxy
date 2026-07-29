@@ -1,5 +1,6 @@
 mod buckets;
 mod list;
+#[cfg(feature = "management")]
 mod management;
 mod objects;
 mod post;
@@ -7,6 +8,7 @@ mod post;
 pub use access_keys::create_access_key;
 pub use buckets::{delete_bucket_route, list_buckets, put_bucket};
 pub use list::get_bucket;
+#[cfg(feature = "management")]
 pub use management::{
     management_abort_multipart_upload, management_audit, management_buckets,
     management_buckets_fragment, management_create_access_key, management_create_bucket,

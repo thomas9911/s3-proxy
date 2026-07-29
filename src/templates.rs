@@ -3,6 +3,7 @@ use askama_web::WebTemplate;
 use axum::body::Body;
 use axum::http::{Response, StatusCode};
 use serde::Deserialize;
+#[cfg(feature = "management")]
 use serde::Serialize;
 use std::borrow::Cow;
 
@@ -22,6 +23,7 @@ pub struct ErrorTemplate<'a> {
     pub message: &'a str,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_dashboard.html")]
 pub struct ManagementDashboardTemplate<'a> {
@@ -29,6 +31,7 @@ pub struct ManagementDashboardTemplate<'a> {
     pub buckets: &'a [ManagementBucket],
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementStatusTemplate {
     pub metadata_ready: bool,
@@ -39,6 +42,7 @@ pub struct ManagementStatusTemplate {
     pub metrics: String,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementAccessKey {
     pub id: String,
@@ -47,6 +51,7 @@ pub struct ManagementAccessKey {
     pub last_used_at: Option<String>,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementPrincipal {
     pub namespace: String,
@@ -55,18 +60,21 @@ pub struct ManagementPrincipal {
     pub access_keys: Vec<ManagementAccessKey>,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementBucket {
     pub namespace: String,
     pub name: String,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementObject {
     pub key: String,
     pub size: u64,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementInspection {
     pub namespace: String,
@@ -80,12 +88,14 @@ pub struct ManagementInspection {
     pub versions: Vec<ManagementVersion>,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementMetadata {
     pub key: String,
     pub value: String,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementVersion {
     pub id: String,
@@ -93,6 +103,7 @@ pub struct ManagementVersion {
     pub delete_marker: bool,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Serialize)]
 pub struct ManagementMultipartUpload {
     pub namespace: String,
@@ -102,24 +113,28 @@ pub struct ManagementMultipartUpload {
     pub created_at: String,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_status.html")]
 pub struct ManagementStatusFragmentTemplate {
     pub status: ManagementStatusTemplate,
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_principals.html")]
 pub struct ManagementPrincipalsFragmentTemplate<'a> {
     pub principals: &'a [ManagementPrincipal],
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_buckets.html")]
 pub struct ManagementBucketsFragmentTemplate<'a> {
     pub buckets: &'a [ManagementBucket],
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_objects.html")]
 pub struct ManagementObjectsFragmentTemplate<'a> {
@@ -128,6 +143,7 @@ pub struct ManagementObjectsFragmentTemplate<'a> {
     pub objects: &'a [ManagementObject],
 }
 
+#[cfg(feature = "management")]
 #[derive(Debug, Template)]
 #[template(path = "management_inspection.html")]
 pub struct ManagementInspectionFragmentTemplate<'a> {

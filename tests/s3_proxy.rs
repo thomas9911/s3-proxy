@@ -7,7 +7,9 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Bucket, CompletedPart, Delete, ObjectIdentifier, Owner};
 use aws_sdk_s3::Client;
 use s3_proxy::metadata::MetaDataBackend;
-use s3_proxy::{build_app, AdminConfig, AppState, Config, ManagementConfig, SqliteConfig};
+#[cfg(feature = "management")]
+use s3_proxy::ManagementConfig;
+use s3_proxy::{build_app, AdminConfig, AppState, Config, SqliteConfig};
 
 #[tokio::test]
 async fn test_it_runs_in_process() {
@@ -25,6 +27,7 @@ async fn test_it_runs_in_process() {
             access_key: "ANOTREAL".to_string(),
             secret_key: "notrealrnrELgWzOk3IfjzDKtFBhDby".to_string(),
         }),
+        #[cfg(feature = "management")]
         management: Some(ManagementConfig {
             username: "dashboard".to_string(),
             password: "dashboard-secret".to_string(),
