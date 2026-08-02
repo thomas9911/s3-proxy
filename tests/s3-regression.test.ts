@@ -1,5 +1,4 @@
-import { Database } from "bun:sqlite";
-import { SQL, S3Client as BunS3Client } from "bun";
+import { S3Client as BunS3Client } from "bun";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { unlink } from "node:fs/promises";
 import { Sha256 } from "@smithy/core/checksum";
@@ -55,11 +54,6 @@ const containerName = `s3-proxy-regression-${process.pid}`;
 const redisContainerName = `s3-proxy-regression-redis-${process.pid}`;
 const postgresContainerName = `s3-proxy-regression-postgres-${process.pid}`;
 const postgresDatabaseUrl = "postgres://postgres:postgres@127.0.0.1:15432/s3proxy";
-const sqliteDatabasePath = `${process.cwd()}\\target\\s3-regression-${process.pid}.db`;
-const sqliteDatabaseUrl =
-	process.env.S3_TEST_SQLITE_URL ??
-	`sqlite://target/s3-regression-${process.pid}.db`;
-const ownsSqliteDatabase = !process.env.S3_TEST_SQLITE_URL;
 const rcloneBinary = process.env.RCLONE ?? `${process.cwd()}\\rclone.exe`;
 const managementUsername = "dashboard";
 const managementPassword = "dashboard-secret";
@@ -290,50 +284,18 @@ async function startTarget() {
 				"POSTGRES_DB=s3proxy",
 				"postgres:latest",
 			]);
-			let seeded = false;
 			for (let attempt = 0; attempt < 30; attempt++) {
-				const postgres = new SQL(postgresDatabaseUrl);
-				try {
-					await postgres`SELECT 1`;
-					await postgres`
-						CREATE TABLE IF NOT EXISTS access_keys (
-							access_key TEXT PRIMARY KEY,
-							secret_key TEXT NOT NULL
-						)
-					`;
-					await postgres`
-						INSERT INTO access_keys (access_key, secret_key)
-						VALUES (${accessKeyId}, ${secretAccessKey})
-						ON CONFLICT (access_key)
-						DO UPDATE SET secret_key = EXCLUDED.secret_key
-					`;
-					await postgres.close();
-					seeded = true;
-					break;
-				} catch (error) {
-					await postgres.close({ timeout: 0 }).catch(() => {});
-					if (attempt === 29) throw error;
-					await sleep(500);
-				}
+				const ready = run(
+					["docker", "exec", postgresContainerName, "pg_isready", "-U", "postgres"],
+					{ check: false },
+				);
+				if (ready.exitCode === 0) break;
+				if (attempt === 29) throw new Error("PostgreSQL did not become ready");
+				await sleep(500);
 			}
-			if (!seeded) throw new Error("PostgreSQL did not become ready");
 		} else if (metadataBackend !== "sqlite") {
 			throw new Error(`unknown metadata backend: ${metadataBackend}`);
-		} else {
-			const database = new Database(sqliteDatabasePath);
-			database.run(`
-				CREATE TABLE IF NOT EXISTS access_keys (
-					access_key TEXT PRIMARY KEY,
-					secret_key TEXT NOT NULL
-				)
-			`);
-			database.run(
-				`INSERT INTO access_keys (access_key, secret_key) VALUES (?, ?)
-				 ON CONFLICT(access_key) DO UPDATE SET secret_key = excluded.secret_key`,
-				[accessKeyId, secretAccessKey],
-			);
-			database.close();
-    }
+		}
     const cargoRunArgs = ["cargo", "run", "--quiet"];
     cargoRunArgs.push("--release");
 		proxyProcess = Bun.spawn(cargoRunArgs, {
@@ -350,7 +312,7 @@ async function startTarget() {
 					? { S3_PROXY__REDIS__URL: "redis://127.0.0.1:16379" }
 					: metadataBackend === "postgres"
 						? { S3_PROXY__POSTGRES__URL: postgresDatabaseUrl }
-						: { S3_PROXY__SQLITE__URL: sqliteDatabaseUrl }),
+					: {}),
 				S3_PROXY__OPENDAL_PROVIDER: opendalProvider,
 				S3_PROXY__OPENDAL__ROOT: "/tmp",
 				...(opendalProvider === "sled"
@@ -451,8 +413,6 @@ afterAll(async () => {
 		run(["docker", "rm", "--force", redisContainerName], { check: false });
 	if (target === "proxy" && metadataBackend === "postgres")
 		run(["docker", "rm", "--force", postgresContainerName], { check: false });
-	if (target === "proxy" && ownsSqliteDatabase)
-		await unlink(sqliteDatabasePath).catch(() => {});
 });
 
 describe("S3 compatibility contract", () => {
