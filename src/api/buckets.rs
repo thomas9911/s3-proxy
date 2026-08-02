@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{templates, AppState};
+use crate::{storage, templates, AppState};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::StatusCode;
@@ -13,33 +13,46 @@ pub async fn list_buckets(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
 
-    let mut lister = opendal_operator
-        .lister_with(&format!("{}/", namespace))
-        .await?;
-
     let mut buckets = Vec::new();
-    while let Some(entry) = lister.next().await {
-        match entry {
-            Ok(entry) => {
-                if entry.metadata().is_dir()
-                    && entry.path().trim_end_matches('/') != namespace
-                    && entry.name().trim_end_matches('/') != ".s3-proxy"
-                {
-                    buckets.push(templates::ListBucketItem {
-                        name: entry.name().trim_end_matches('/').to_string().into(),
-                        timestamp: None,
-                    })
+    if storage::is_single_bucket(&config) {
+        if let Some(single) = config
+            .single_bucket
+            .as_ref()
+            .filter(|single| single.namespace == *namespace)
+        {
+            buckets.push(templates::ListBucketItem {
+                name: single.name.as_str().into(),
+                timestamp: None,
+            });
+        }
+    } else {
+        let mut lister = opendal_operator
+            .lister_with(&format!("{}/", namespace))
+            .await?;
+        while let Some(entry) = lister.next().await {
+            match entry {
+                Ok(entry) => {
+                    if entry.metadata().is_dir()
+                        && entry.path().trim_end_matches('/') != namespace
+                        && entry.name().trim_end_matches('/') != ".s3-proxy"
+                    {
+                        buckets.push(templates::ListBucketItem {
+                            name: entry.name().trim_end_matches('/').to_string().into(),
+                            timestamp: None,
+                        })
+                    }
                 }
-            }
-            Err(error) => {
-                tracing::error!("{}", error);
-                return Err(RouteError::new_internal_server());
+                Err(error) => {
+                    tracing::error!(%error, "failed to list buckets");
+                    return Err(RouteError::new_internal_server());
+                }
             }
         }
     }
@@ -171,11 +184,27 @@ async fn create_bucket_inner(
     AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
+
+    if storage::is_single_bucket(&config) {
+        if storage::bucket_prefix(&config, namespace, &bucket_name).is_some() {
+            return Ok(s3_error_response(
+                StatusCode::CONFLICT,
+                "BucketAlreadyOwnedByYou",
+                "The configured bucket already exists.",
+            ));
+        }
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The requested bucket is not configured.",
+        ));
+    }
 
     let utf8_slice = match std::str::from_utf8(&signature.bytes) {
         Ok(body) => body,
@@ -252,11 +281,19 @@ pub(crate) async fn delete_bucket_inner(
     AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = signature.namespace;
+    if storage::is_single_bucket(&config) {
+        return Ok(s3_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "OperationNotSupported",
+            "The configured single bucket cannot be deleted.",
+        ));
+    }
     let bucket_path = format!("{}/{}/", namespace, bucket_name);
     if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(

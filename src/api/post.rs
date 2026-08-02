@@ -1170,6 +1170,8 @@ mod tests {
             quotas: crate::quota::QuotaConfig::default(),
             opendal_provider: "memory".to_string(),
             opendal: HashMap::new(),
+            storage_layout: crate::StorageLayout::Namespaced,
+            single_bucket: None,
         };
         (
             AppState {

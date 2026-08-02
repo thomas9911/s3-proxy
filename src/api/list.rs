@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{templates, AppState};
+use crate::{storage, templates, AppState};
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Path, Query, State};
@@ -287,6 +287,8 @@ mod tests {
                 quotas: crate::quota::QuotaConfig::default(),
                 opendal_provider: "memory".to_string(),
                 opendal: HashMap::new(),
+                storage_layout: crate::StorageLayout::Namespaced,
+                single_bucket: None,
             }),
             opendal_operator: operator,
         };
@@ -307,17 +309,22 @@ async fn list_objects_inner(
     bucket_name: String,
     query: HashMap<String, String>,
     AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
-    let bucket_prefix = format!("{}/{}/", namespace, bucket_name);
+    let Some(bucket_prefix) = storage::bucket_prefix(&config, namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_prefix).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -356,6 +363,9 @@ async fn list_objects_inner(
                         .path()
                         .strip_prefix(&bucket_prefix)
                         .unwrap_or(entry.path());
+                    if key == ".s3-proxy" || key.starts_with(".s3-proxy/") {
+                        continue;
+                    }
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
                     let last_modified =
                         metadata.last_modified().map(|dt| Cow::from(dt.to_string()));

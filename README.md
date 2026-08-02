@@ -58,6 +58,27 @@ For example, an S3 service can be configured with
 Set both admin variables to create the initial credential on startup. Existing
 credentials are not overwritten.
 
+## Metadata synchronization
+
+To adopt existing data, arrange it in the proxy storage layout
+`namespace/bucket/key`, configure OpenDAL and the metadata store, then run a
+one-shot metadata import before starting the server:
+
+```text
+cargo run --release -- --sync-metadata --dry-run
+cargo run --release -- --sync-metadata
+```
+
+Use `--namespace admin` to import only one namespace. The command creates a
+default namespace owner only when it is absent and imports content type, size,
+ETag, and last-modified values from OpenDAL. It never changes object data,
+access keys, ACLs, bucket policies, or versioning state. Imported objects are
+private unless access-control metadata already exists.
+
+This command does not remap a flat external S3 bucket into the proxy layout.
+For an existing filesystem or OpenDAL S3 service, set its root/prefix or move
+the data so that the proxy can see `namespace/bucket/key` paths first.
+
 ## Operations
 
 `GET /healthz` reports process health, `GET /readyz` verifies the metadata and

@@ -35,6 +35,8 @@ async fn test_it_runs_in_process() {
         quotas: s3_proxy::quota::QuotaConfig::default(),
         opendal_provider: "memory".to_string(),
         opendal: HashMap::new(),
+        storage_layout: s3_proxy::StorageLayout::Namespaced,
+        single_bucket: None,
     };
     let state = AppState::from_config(config).await.unwrap();
     state

@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{metadata::ObjectMetadata, templates, AppState};
+use crate::{metadata::ObjectMetadata, storage, templates, AppState};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::header::{
@@ -26,10 +26,14 @@ pub async fn create_object(
     crate::metrics::record_storage();
     let namespace = signature.namespace;
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -37,7 +41,8 @@ pub async fn create_object(
         ));
     }
 
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let filepath = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("bucket path was validated above");
     let content_length = signature.bytes.len() as u64;
     if !crate::quota::allows_storage(
         &config.quotas,
@@ -255,11 +260,18 @@ async fn copy_object(
         ..
     } = state;
     let namespace = signature.namespace;
-    let destination_bucket = format!("{namespace}/{bucket_name}/");
-    if !opendal_operator
-        .exists(&destination_bucket)
-        .await
-        .unwrap_or(false)
+    let Some(destination_bucket) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        );
+    };
+    if !storage::is_single_bucket(&config)
+        && !opendal_operator
+            .exists(&destination_bucket)
+            .await
+            .unwrap_or(false)
     {
         return s3_error_response(
             StatusCode::NOT_FOUND,
@@ -267,8 +279,15 @@ async fn copy_object(
             "The specified bucket does not exist.",
         );
     }
-    let from = format!("{namespace}/{source_bucket}/{source_object}");
-    let to = format!("{namespace}/{bucket_name}/{object_name}");
+    let Some(from) = storage::object_path(&config, &namespace, source_bucket, source_object) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified source bucket does not exist.",
+        );
+    };
+    let to = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("destination bucket path was validated above");
     if !opendal_operator.exists(&from).await.unwrap_or(false) {
         return s3_error_response(
             StatusCode::NOT_FOUND,
@@ -412,13 +431,18 @@ pub async fn get_object(
     let AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     } = state;
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -454,7 +478,8 @@ pub async fn get_object(
             ))
         }
         Ok(None) => (
-            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            storage::object_path(&config, &namespace, &bucket_name, &object_name)
+                .expect("bucket path was validated above"),
             None,
         ),
         Err(error) => {
@@ -611,10 +636,17 @@ pub async fn head_object(
     let AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     } = state;
-    let bucket_path = format!("{}/{}/", namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -650,7 +682,8 @@ pub async fn head_object(
             ))
         }
         Ok(None) => (
-            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            storage::object_path(&config, &namespace, &bucket_name, &object_name)
+                .expect("bucket path was validated above"),
             None,
         ),
         Err(error) => {
@@ -706,23 +739,29 @@ pub async fn delete_object(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     crate::metrics::record_storage();
     let namespace = signature.namespace;
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist.",
         ));
     }
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let filepath = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("bucket path was validated above");
     if opendal_operator.exists(&filepath).await? {
         crate::retry::retry("delete_object", || opendal_operator.delete(&filepath)).await?;
     }
@@ -857,6 +896,8 @@ mod tests {
             quotas: crate::quota::QuotaConfig::default(),
             opendal_provider: "memory".to_string(),
             opendal: HashMap::new(),
+            storage_layout: crate::StorageLayout::Namespaced,
+            single_bucket: None,
         };
         (
             AppState {
