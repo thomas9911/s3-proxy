@@ -1044,7 +1044,6 @@ async fn add_user_metadata(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{copy_object, create_object, get_object, public_acl, resolve_read_namespace};

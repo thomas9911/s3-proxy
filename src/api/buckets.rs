@@ -84,6 +84,12 @@ pub async fn put_bucket(
         .unwrap_or_default()
         .split('&')
         .any(|part| part == "versioning" || part.starts_with("versioning="));
+    let is_acl = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "acl" || part.starts_with("acl="));
     let header_map = request.headers().clone();
     let signature = match VerifiedRequest::from_request(request, &state).await {
         Ok(signature) => signature,
@@ -117,6 +123,14 @@ pub async fn put_bucket(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if is_acl {
+        return s3_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "Bucket ACLs are not supported; use a bucket policy instead.",
+        );
     }
 
     if is_versioning {

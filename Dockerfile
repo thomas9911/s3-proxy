@@ -2,8 +2,7 @@ FROM chainguard/wolfi-base:latest AS builder
 
 RUN apk add --no-cache build-base rust
 
-ENV CARGO_BUILD_JOBS=1 \
-    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ARG CARGO_BUILD_JOBS=1 CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
@@ -14,7 +13,7 @@ RUN cargo build --release --locked
 
 FROM chainguard/wolfi-base:latest
 
-RUN apk add --no-cache ca-certificates libgcc libstdc++
+RUN apk add --no-cache ca-certificates libgcc
 
 COPY --from=builder /build/target/release/s3-proxy /usr/local/bin/s3-proxy
 

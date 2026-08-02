@@ -5,6 +5,7 @@
 	"scripts": {
 		"test": "bun test tests/s3-regression.test.ts",
 		"regression": "bun run tests/run-regression.ts",
+		"serve-data": "bun run scripts/serve-data.ts",
 		"typecheck": "tsc -p tsconfig.json",
 		"crap": "cargo llvm-cov --lcov --output-path lcov.info && python ./scripts/normalize-lcov.py lcov.info lcov.relative.info && cargo crap --lcov lcov.relative.info --top 20 --format json"
 	},
