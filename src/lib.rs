@@ -385,6 +385,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 async fn metadata_debug(
     State(AppState { metadata_store, .. }): State<AppState>,
 ) -> Result<impl IntoResponse, RouteError> {

@@ -172,7 +172,7 @@ pub async fn get_bucket(
 
     list_objects_inner(bucket_name, query, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn list_object_versions(
@@ -310,6 +310,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 async fn list_objects_inner(
     bucket_name: String,
     query: HashMap<String, String>,

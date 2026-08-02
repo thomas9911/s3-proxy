@@ -227,7 +227,7 @@ async fn create_access_key_response(
         );
     }
 
-    let (access_key, secret_key) = match create_unique_access_key(&state, user_name).await {
+    let (access_key, secret_key) = match create_unique_access_key(state, user_name).await {
         Ok(credentials) => credentials,
         Err(error) => {
             tracing::error!(%error, "failed to create access key");

@@ -878,7 +878,8 @@ async fn status(state: &AppState) -> templates::ManagementStatusTemplate {
         ("recursive_list", capability.list_with_recursive),
     ]
     .into_iter()
-    .filter_map(|(name, supported)| supported.then(|| name.to_string()))
+    .filter(|(_, supported)| *supported)
+    .map(|(name, _)| name.to_string())
     .collect();
     templates::ManagementStatusTemplate {
         metadata_ready: state.metadata_store.debug_keys("__readyz__").await.is_ok(),
@@ -1518,6 +1519,7 @@ fn invalid_request(error: impl std::fmt::Display) -> Response {
     (StatusCode::BAD_REQUEST, error.to_string()).into_response()
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
     let Some(config) = state.config.management.as_ref() else {
         return Err(StatusCode::NOT_FOUND.into_response());

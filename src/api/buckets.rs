@@ -172,7 +172,7 @@ pub async fn put_bucket(
 
     create_bucket_inner(bucket_name, header_map, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,7 +280,7 @@ pub async fn delete_bucket_route(
 
     delete_bucket_inner(bucket_name, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub(crate) async fn delete_bucket_inner(

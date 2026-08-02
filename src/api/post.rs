@@ -65,7 +65,7 @@ pub async fn post_object_route(
         };
         return initiate_multipart(bucket_name, object_name, State(state), verified)
             .await
-            .map_or_else(IntoResponse::into_response, |response| response);
+            .unwrap_or_else(IntoResponse::into_response);
     }
     let Some(upload_id) = query_value(request.uri().query(), "uploadId") else {
         return s3_error_response(
@@ -80,7 +80,7 @@ pub async fn post_object_route(
     };
     complete_multipart(bucket_name, object_name, state, verified, upload_id)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub async fn initiate_multipart(

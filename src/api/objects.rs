@@ -217,14 +217,14 @@ pub async fn put_object(
             part_number,
         )
         .await
-        .map_or_else(IntoResponse::into_response, |response| response);
+        .unwrap_or_else(IntoResponse::into_response);
     }
     if let Some(source) = headers.get("x-amz-copy-source").cloned() {
         return copy_object(path, headers, state, verified, &source).await;
     }
     create_object(path, headers, State(state), verified)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn copy_object(
@@ -513,13 +513,12 @@ pub async fn get_object(
         .await?;
 
     let object_length = metadata.content_length();
-    let range = match range_header
-        .as_ref()
-        .map(|value| parse_range(value, object_length))
-        .transpose()
-    {
-        Ok(range) => range,
-        Err(response) => return Ok(response),
+    let range = match range_header.as_ref() {
+        Some(value) => match parse_range(value, object_length) {
+            Ok(range) => Some(range),
+            Err(response) => return Ok(response),
+        },
+        None => None,
     };
     let reader = opendal_operator.reader(&filepath).await?;
 
@@ -545,7 +544,7 @@ pub async fn get_object(
         .unwrap_or_else(SystemTime::now);
     response_headers.insert(
         LAST_MODIFIED,
-        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified))?,
     );
     add_user_metadata(&mut response_headers, &stored_metadata).await?;
 
@@ -580,6 +579,7 @@ pub async fn get_object(
     Ok((status, response_headers, Body::from_stream(stream)).into_response())
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_range(value: &HeaderValue, length: u64) -> Result<std::ops::Range<u64>, Response> {
     let value = value.to_str().ok();
     let Some(value) = value.and_then(|value| value.strip_prefix("bytes=")) else {
@@ -734,7 +734,7 @@ pub async fn head_object(
         .unwrap_or_else(SystemTime::now);
     headers.insert(
         LAST_MODIFIED,
-        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified))?,
     );
     add_user_metadata(&mut headers, &stored_metadata).await?;
     Ok((StatusCode::OK, headers).into_response())
@@ -848,11 +848,11 @@ pub async fn delete_object_route(
     if let Some(upload_id) = upload_id {
         return super::post::abort_multipart(bucket_name, state, verified, upload_id)
             .await
-            .map_or_else(IntoResponse::into_response, |response| response);
+            .unwrap_or_else(IntoResponse::into_response);
     }
     delete_object(path, State(state), verified)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
@@ -865,6 +865,185 @@ pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
             _ => None,
         })
 }
+
+async fn resolve_policy_namespace(
+    state: &AppState,
+    bucket_name: &str,
+    object_name: &str,
+    action: &str,
+    principal: Option<&str>,
+) -> Option<String> {
+    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
+    let policies = state
+        .metadata_store
+        .bucket_policies(bucket_name)
+        .await
+        .ok()?;
+    policies.into_iter().find_map(|(namespace, policy)| {
+        crate::policy::decision(&policy, principal, action, &resource)
+            .ok()
+            .filter(|decision| *decision == crate::policy::Decision::Allow)
+            .map(|_| namespace)
+    })
+}
+
+async fn authorize_policy_namespace(
+    state: &AppState,
+    bucket_name: &str,
+    object_name: &str,
+    action: &str,
+    principal: &str,
+    fallback: &str,
+) -> Result<String, Response> {
+    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
+    for (namespace, policy) in state
+        .metadata_store
+        .bucket_policies(bucket_name)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve bucket policy");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+    {
+        match crate::policy::decision(&policy, Some(principal), action, &resource).map_err(
+            |error| {
+                tracing::warn!(%error, "invalid bucket policy");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            },
+        )? {
+            crate::policy::Decision::Deny => {
+                return Err(s3_error_response(
+                    StatusCode::FORBIDDEN,
+                    "AccessDenied",
+                    "Access Denied",
+                ));
+            }
+            crate::policy::Decision::Allow => return Ok(namespace),
+            crate::policy::Decision::None => {}
+        }
+    }
+    Ok(fallback.to_string())
+}
+
+fn query_value(query: Option<&str>, key: &str) -> Option<String> {
+    query?.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=').unwrap_or((part, ""));
+        (name == key).then(|| value.to_string())
+    })
+}
+
+async fn resolve_read_namespace(
+    request: Request,
+    state: &AppState,
+    bucket_name: &str,
+    object_name: &str,
+) -> Result<String, Response<Body>> {
+    if request.headers().contains_key(AUTHORIZATION)
+        || crate::signature::has_presigned_query(request.uri())
+    {
+        let verified = VerifiedRequest::from_request(request, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
+        for (namespace, policy) in state
+            .metadata_store
+            .bucket_policies(bucket_name)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to resolve bucket policy");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?
+        {
+            match crate::policy::decision(
+                &policy,
+                Some(&verified.namespace),
+                "s3:GetObject",
+                &resource,
+            )
+            .map_err(|error| {
+                tracing::warn!(%error, "invalid bucket policy");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })? {
+                crate::policy::Decision::Deny => {
+                    return Err(s3_error_response(
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        "Access Denied",
+                    ));
+                }
+                crate::policy::Decision::Allow => return Ok(namespace),
+                crate::policy::Decision::None => {}
+            }
+        }
+        return Ok(verified.namespace);
+    }
+
+    if crate::policy::allows_public_read_acl("s3:GetObject") {
+        if let Some(namespace) = state
+            .metadata_store
+            .public_object_namespace(bucket_name, object_name)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to resolve public object");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?
+        {
+            return Ok(namespace);
+        }
+    }
+
+    if crate::policy::allows_public_read_acl("s3:GetObject") {
+        if let Some(namespace) = state
+            .metadata_store
+            .public_bucket_namespace(bucket_name)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "failed to resolve public bucket");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            })?
+        {
+            return Ok(namespace);
+        }
+    }
+
+    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
+    for (namespace, policy) in state
+        .metadata_store
+        .bucket_policies(bucket_name)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "failed to resolve bucket policy");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })?
+    {
+        if crate::policy::allows_anonymous(&policy, "s3:GetObject", &resource).map_err(|error| {
+            tracing::warn!(%error, "invalid bucket policy");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        })? {
+            return Ok(namespace);
+        }
+    }
+
+    Err(s3_error_response(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "Access Denied",
+    ))
+}
+
+async fn add_user_metadata(
+    headers: &mut HeaderMap,
+    metadata: &ObjectMetadata,
+) -> Result<(), RouteError> {
+    for (key, value) in &metadata.user_metadata {
+        headers.insert(
+            HeaderName::from_str(&format!("x-amz-meta-{key}"))?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1064,182 +1243,4 @@ mod tests {
             None
         );
     }
-}
-
-async fn resolve_policy_namespace(
-    state: &AppState,
-    bucket_name: &str,
-    object_name: &str,
-    action: &str,
-    principal: Option<&str>,
-) -> Option<String> {
-    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
-    let policies = state
-        .metadata_store
-        .bucket_policies(bucket_name)
-        .await
-        .ok()?;
-    policies.into_iter().find_map(|(namespace, policy)| {
-        crate::policy::decision(&policy, principal, action, &resource)
-            .ok()
-            .filter(|decision| *decision == crate::policy::Decision::Allow)
-            .map(|_| namespace)
-    })
-}
-
-async fn authorize_policy_namespace(
-    state: &AppState,
-    bucket_name: &str,
-    object_name: &str,
-    action: &str,
-    principal: &str,
-    fallback: &str,
-) -> Result<String, Response> {
-    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
-    for (namespace, policy) in state
-        .metadata_store
-        .bucket_policies(bucket_name)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to resolve bucket policy");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
-    {
-        match crate::policy::decision(&policy, Some(principal), action, &resource).map_err(
-            |error| {
-                tracing::warn!(%error, "invalid bucket policy");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            },
-        )? {
-            crate::policy::Decision::Deny => {
-                return Err(s3_error_response(
-                    StatusCode::FORBIDDEN,
-                    "AccessDenied",
-                    "Access Denied",
-                ));
-            }
-            crate::policy::Decision::Allow => return Ok(namespace),
-            crate::policy::Decision::None => {}
-        }
-    }
-    Ok(fallback.to_string())
-}
-
-fn query_value(query: Option<&str>, key: &str) -> Option<String> {
-    query?.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=').unwrap_or((part, ""));
-        (name == key).then(|| value.to_string())
-    })
-}
-
-async fn resolve_read_namespace(
-    request: Request,
-    state: &AppState,
-    bucket_name: &str,
-    object_name: &str,
-) -> Result<String, Response<Body>> {
-    if request.headers().contains_key(AUTHORIZATION)
-        || crate::signature::has_presigned_query(request.uri())
-    {
-        let verified = VerifiedRequest::from_request(request, state)
-            .await
-            .map_err(IntoResponse::into_response)?;
-        let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
-        for (namespace, policy) in state
-            .metadata_store
-            .bucket_policies(bucket_name)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "failed to resolve bucket policy");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?
-        {
-            match crate::policy::decision(
-                &policy,
-                Some(&verified.namespace),
-                "s3:GetObject",
-                &resource,
-            )
-            .map_err(|error| {
-                tracing::warn!(%error, "invalid bucket policy");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })? {
-                crate::policy::Decision::Deny => {
-                    return Err(s3_error_response(
-                        StatusCode::FORBIDDEN,
-                        "AccessDenied",
-                        "Access Denied",
-                    ));
-                }
-                crate::policy::Decision::Allow => return Ok(namespace),
-                crate::policy::Decision::None => {}
-            }
-        }
-        return Ok(verified.namespace);
-    }
-
-    if crate::policy::allows_public_read_acl("s3:GetObject") {
-        if let Some(namespace) = state
-            .metadata_store
-            .public_object_namespace(bucket_name, object_name)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "failed to resolve public object");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?
-        {
-            return Ok(namespace);
-        }
-    }
-
-    if crate::policy::allows_public_read_acl("s3:GetObject") {
-        if let Some(namespace) = state
-            .metadata_store
-            .public_bucket_namespace(bucket_name)
-            .await
-            .map_err(|error| {
-                tracing::error!(%error, "failed to resolve public bucket");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            })?
-        {
-            return Ok(namespace);
-        }
-    }
-
-    let resource = format!("arn:aws:s3:::{bucket_name}/{object_name}");
-    for (namespace, policy) in state
-        .metadata_store
-        .bucket_policies(bucket_name)
-        .await
-        .map_err(|error| {
-            tracing::error!(%error, "failed to resolve bucket policy");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })?
-    {
-        if crate::policy::allows_anonymous(&policy, "s3:GetObject", &resource).map_err(|error| {
-            tracing::warn!(%error, "invalid bucket policy");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        })? {
-            return Ok(namespace);
-        }
-    }
-
-    Err(s3_error_response(
-        StatusCode::FORBIDDEN,
-        "AccessDenied",
-        "Access Denied",
-    ))
-}
-
-async fn add_user_metadata(
-    headers: &mut HeaderMap,
-    metadata: &ObjectMetadata,
-) -> Result<(), RouteError> {
-    for (key, value) in &metadata.user_metadata {
-        headers.insert(
-            HeaderName::from_str(&format!("x-amz-meta-{key}"))?,
-            HeaderValue::from_str(value)?,
-        );
-    }
-    Ok(())
 }
