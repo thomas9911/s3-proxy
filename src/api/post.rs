@@ -2,7 +2,7 @@ use crate::signature::s3_error_response;
 use crate::signature::VerifiedRequest;
 use crate::{
     metadata::{AccessKeyStatus, ObjectMetadata},
-    templates, AppState,
+    storage, templates, AppState,
 };
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
 use axum::body::Body;
@@ -87,13 +87,22 @@ pub async fn initiate_multipart(
     bucket_name: String,
     object_name: String,
     State(AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     crate::metrics::record_storage();
-    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &signature.namespace, &bucket_name)
+    else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -108,10 +117,11 @@ pub async fn initiate_multipart(
             .as_nanos()
     );
     opendal_operator
-        .create_dir(&format!(
-            "{}/{}/",
-            signature.namespace,
-            multipart_prefix(&upload_id)
+        .create_dir(&multipart_prefix(
+            &config,
+            &signature.namespace,
+            &bucket_name,
+            &upload_id,
         ))
         .await?;
     let manifest = MultipartManifest {
@@ -124,7 +134,7 @@ pub async fn initiate_multipart(
     };
     opendal_operator
         .write(
-            &multipart_manifest_path(&signature.namespace, &upload_id),
+            &multipart_manifest_path(&config, &signature.namespace, &bucket_name, &upload_id),
             serde_json::to_vec(&manifest)?,
         )
         .await?;
@@ -155,10 +165,19 @@ pub async fn upload_part(
         ));
     }
     let AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     } = state;
-    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &signature.namespace, &bucket_name)
+    else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -167,6 +186,7 @@ pub async fn upload_part(
     }
     if !manifest_matches(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &upload_id,
         &bucket_name,
@@ -180,7 +200,13 @@ pub async fn upload_part(
             "The specified upload does not exist.",
         ));
     }
-    let part_path = multipart_part_path(&signature.namespace, &upload_id, part_number);
+    let part_path = multipart_part_path(
+        &config,
+        &signature.namespace,
+        &bucket_name,
+        &upload_id,
+        part_number,
+    );
     let etag = format!("{:x}", Md5::digest(&signature.bytes));
     opendal_operator.write(&part_path, signature.bytes).await?;
     Ok(Response::builder()
@@ -214,8 +240,15 @@ pub async fn complete_multipart(
         config,
         ..
     } = state;
-    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &signature.namespace, &bucket_name)
+    else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -224,6 +257,7 @@ pub async fn complete_multipart(
     }
     if !manifest_matches(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &upload_id,
         &bucket_name,
@@ -253,10 +287,18 @@ pub async fn complete_multipart(
             "The multipart completion request is invalid.",
         ));
     }
-    let object_path = format!("{}/{}/{}", signature.namespace, bucket_name, object_name);
+    let object_path =
+        storage::object_path(&config, &signature.namespace, &bucket_name, &object_name)
+            .expect("validated bucket layout");
     let mut expected_length = 0u64;
     for part in &parts {
-        let path = multipart_part_path(&signature.namespace, &upload_id, part.part_number);
+        let path = multipart_part_path(
+            &config,
+            &signature.namespace,
+            &bucket_name,
+            &upload_id,
+            part.part_number,
+        );
         expected_length += match opendal_operator.stat(&path).await {
             Ok(metadata) => metadata.content_length(),
             Err(_) => {
@@ -285,6 +327,7 @@ pub async fn complete_multipart(
     }
     crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &bucket_name,
         &object_name,
@@ -294,7 +337,13 @@ pub async fn complete_multipart(
     let mut writer = opendal_operator.writer(&object_path).await?;
     let mut content_length = 0u64;
     for part in &parts {
-        let path = multipart_part_path(&signature.namespace, &upload_id, part.part_number);
+        let path = multipart_part_path(
+            &config,
+            &signature.namespace,
+            &bucket_name,
+            &upload_id,
+            part.part_number,
+        );
         let reader = match opendal_operator.reader(&path).await {
             Ok(reader) => reader,
             Err(_) => {
@@ -360,13 +409,14 @@ pub async fn complete_multipart(
     .await?;
     let version_id = crate::versioning::record_put(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &bucket_name,
         &object_name,
         &object_path,
     )
     .await?;
-    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    let prefix = multipart_prefix(&config, &signature.namespace, &bucket_name, &upload_id);
     opendal_operator
         .delete_with(&prefix)
         .recursive(true)
@@ -402,10 +452,19 @@ pub async fn abort_multipart(
         ));
     }
     let AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     } = state;
-    let bucket_path = format!("{}/{}/", signature.namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &signature.namespace, &bucket_name)
+    else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -414,6 +473,7 @@ pub async fn abort_multipart(
     }
     if !manifest_matches(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &upload_id,
         &bucket_name,
@@ -427,7 +487,7 @@ pub async fn abort_multipart(
             "The specified upload does not exist.",
         ));
     }
-    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    let prefix = multipart_prefix(&config, &signature.namespace, &bucket_name, &upload_id);
     opendal_operator
         .delete_with(&prefix)
         .recursive(true)
@@ -450,10 +510,13 @@ pub async fn list_parts(
         ));
     }
     let AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     } = state;
     if !manifest_matches(
         &opendal_operator,
+        &config,
         &signature.namespace,
         &upload_id,
         &bucket_name,
@@ -467,7 +530,7 @@ pub async fn list_parts(
             "The specified upload does not exist.",
         ));
     }
-    let prefix = format!("{}/{}/", signature.namespace, multipart_prefix(&upload_id));
+    let prefix = multipart_prefix(&config, &signature.namespace, &bucket_name, &upload_id);
     let mut lister = opendal_operator.lister_with(&prefix).await?;
     let mut parts = Vec::new();
     while let Some(entry) = lister.next().await {
@@ -527,26 +590,55 @@ fn valid_upload_id(upload_id: &str) -> bool {
     !upload_id.is_empty() && upload_id.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn multipart_prefix(upload_id: &str) -> String {
-    format!(".multipart/{upload_id}")
+fn multipart_prefix(
+    config: &crate::Config,
+    namespace: &str,
+    bucket: &str,
+    upload_id: &str,
+) -> String {
+    storage::internal_path(
+        config,
+        namespace,
+        bucket,
+        &format!("multipart/{upload_id}/"),
+    )
+    .expect("validated bucket layout")
 }
 
-fn multipart_part_path(namespace: &str, upload_id: &str, part_number: u32) -> String {
-    format!("{namespace}/{}/{part_number}", multipart_prefix(upload_id))
+fn multipart_part_path(
+    config: &crate::Config,
+    namespace: &str,
+    bucket: &str,
+    upload_id: &str,
+    part_number: u32,
+) -> String {
+    format!(
+        "{}{part_number}",
+        multipart_prefix(config, namespace, bucket, upload_id)
+    )
 }
 
-fn multipart_manifest_path(namespace: &str, upload_id: &str) -> String {
-    format!("{namespace}/{}/manifest.json", multipart_prefix(upload_id))
+fn multipart_manifest_path(
+    config: &crate::Config,
+    namespace: &str,
+    bucket: &str,
+    upload_id: &str,
+) -> String {
+    format!(
+        "{}manifest.json",
+        multipart_prefix(config, namespace, bucket, upload_id)
+    )
 }
 
 async fn manifest_matches(
     operator: &opendal::Operator,
+    config: &crate::Config,
     namespace: &str,
     upload_id: &str,
     bucket: &str,
     object: &str,
 ) -> anyhow::Result<bool> {
-    let path = multipart_manifest_path(namespace, upload_id);
+    let path = multipart_manifest_path(config, namespace, bucket, upload_id);
     if !operator.exists(&path).await? {
         return Ok(false);
     }
@@ -624,10 +716,14 @@ pub async fn post_object(
             "The request quota for this principal has been exceeded.",
         ));
     }
-    if !opendal_operator
-        .exists(&format!("{namespace}/{bucket_name}/"))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -752,7 +848,8 @@ pub async fn post_object(
     let content_length = file.len() as u64;
     let content_type = fields.get("content-type").cloned();
     metadata_store.record_access_key_use(access_key).await?;
-    let filepath = format!("{namespace}/{bucket_name}/{key}");
+    let filepath = storage::object_path(&config, &namespace, &bucket_name, &key)
+        .expect("validated bucket layout");
     if !crate::quota::allows_storage(
         &config.quotas,
         &opendal_operator,
@@ -770,6 +867,7 @@ pub async fn post_object(
     }
     crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &key,
@@ -810,9 +908,15 @@ pub async fn post_object(
             },
         )
         .await?;
-    let version_id =
-        crate::versioning::record_put(&opendal_operator, &namespace, &bucket_name, &key, &filepath)
-            .await?;
+    let version_id = crate::versioning::record_put(
+        &opendal_operator,
+        &config,
+        &namespace,
+        &bucket_name,
+        &key,
+        &filepath,
+    )
+    .await?;
     let mut response = StatusCode::NO_CONTENT.into_response();
     if let Some(version_id) = version_id {
         response
@@ -827,6 +931,7 @@ async fn delete_objects(
     AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }: AppState,
     signature: VerifiedRequest,
@@ -847,10 +952,14 @@ async fn delete_objects(
     }
 
     let namespace = signature.namespace;
-    if !opendal_operator
-        .exists(&format!("{namespace}/{bucket_name}/"))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -886,11 +995,13 @@ async fn delete_objects(
     let results = tokio_stream::iter(object_batches.into_iter().map(|objects| {
         let metadata_store = metadata_store.clone();
         let opendal_operator = opendal_operator.clone();
+        let config = config.clone();
         let namespace = namespace.clone();
         let bucket_name = bucket_name.clone();
         async move {
             delete_batch(
                 &opendal_operator,
+                &config,
                 &metadata_store,
                 &namespace,
                 &bucket_name,
@@ -923,6 +1034,7 @@ async fn delete_objects(
 
 async fn delete_batch(
     opendal_operator: &opendal::Operator,
+    config: &crate::Config,
     metadata_store: &std::sync::Arc<dyn crate::metadata::MetadataStore>,
     namespace: &str,
     bucket_name: &str,
@@ -933,7 +1045,8 @@ async fn delete_batch(
         let namespace = namespace.to_string();
         let bucket_name = bucket_name.to_string();
         async move {
-            let filepath = format!("{namespace}/{bucket_name}/{}", object.key);
+            let filepath = storage::object_path(config, &namespace, &bucket_name, &object.key)
+                .expect("validated bucket layout");
             let mut deleter = opendal_operator
                 .deleter()
                 .await
@@ -971,9 +1084,15 @@ async fn delete_batch(
     .await
     .map_err(|error| delete_error(String::new(), error))?;
     for object in &object_names {
-        crate::versioning::record_delete_marker(opendal_operator, namespace, bucket_name, object)
-            .await
-            .map_err(|error| delete_error((*object).to_string(), error))?;
+        crate::versioning::record_delete_marker(
+            opendal_operator,
+            config,
+            namespace,
+            bucket_name,
+            object,
+        )
+        .await
+        .map_err(|error| delete_error((*object).to_string(), error))?;
         crate::retry::retry("delete_object_public_acl", || {
             metadata_store.set_object_public(namespace, bucket_name, object, false)
         })
@@ -1207,12 +1326,17 @@ mod tests {
 
         let upload_id = "abc123";
         operator
-            .create_dir(&format!("namespace/{}/", multipart_prefix(upload_id)))
+            .create_dir(&multipart_prefix(
+                &state.config,
+                "namespace",
+                "bucket",
+                upload_id,
+            ))
             .await
             .unwrap();
         operator
             .write(
-                &multipart_manifest_path("namespace", upload_id),
+                &multipart_manifest_path(&state.config, "namespace", "bucket", upload_id),
                 serde_json::to_vec(&MultipartManifest {
                     bucket: "bucket".to_string(),
                     object: "object.txt".to_string(),
@@ -1259,7 +1383,7 @@ mod tests {
         let complete_response = complete_multipart(
             "bucket".to_string(),
             "object.txt".to_string(),
-            state,
+            state.clone(),
             crate::signature::VerifiedRequest {
                 access_key: "access".to_string(),
                 namespace: "namespace".to_string(),
@@ -1302,6 +1426,7 @@ mod tests {
         let metadata_trait: Arc<dyn MetadataStore> = metadata_store.clone();
         let (deleted, errors) = delete_batch(
             &operator,
+            &state.config,
             &metadata_trait,
             "namespace",
             "bucket",
@@ -1321,12 +1446,22 @@ mod tests {
             .unwrap();
         let abort_upload_id = "def456";
         abort_operator
-            .create_dir(&format!("namespace/{}/", multipart_prefix(abort_upload_id)))
+            .create_dir(&multipart_prefix(
+                &abort_state.config,
+                "namespace",
+                "bucket",
+                abort_upload_id,
+            ))
             .await
             .unwrap();
         abort_operator
             .write(
-                &multipart_manifest_path("namespace", abort_upload_id),
+                &multipart_manifest_path(
+                    &abort_state.config,
+                    "namespace",
+                    "bucket",
+                    abort_upload_id,
+                ),
                 serde_json::to_vec(&MultipartManifest {
                     bucket: "bucket".to_string(),
                     object: "aborted.txt".to_string(),

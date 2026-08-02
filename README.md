@@ -79,6 +79,20 @@ This command does not remap a flat external S3 bucket into the proxy layout.
 For an existing filesystem or OpenDAL S3 service, set its root/prefix or move
 the data so that the proxy can see `namespace/bucket/key` paths first.
 
+## Single-bucket layout
+
+To serve an existing OpenDAL root as one S3 bucket without moving files, set:
+
+```text
+S3_PROXY__STORAGE_LAYOUT=single_bucket
+S3_PROXY__SINGLE_BUCKET__NAMESPACE=admin
+S3_PROXY__SINGLE_BUCKET__NAME=storage
+```
+
+For example, `photos/cat.jpg` at the configured physical root is exposed as
+`s3://storage/photos/cat.jpg`. Proxy-owned multipart and versioning state is
+stored under `.s3-proxy/` and is excluded from object listings.
+
 ## Operations
 
 `GET /healthz` reports process health, `GET /readyz` verifies the metadata and

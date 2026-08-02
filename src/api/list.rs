@@ -146,6 +146,7 @@ pub async fn get_bucket(
     if is_versioning {
         let status = match crate::versioning::bucket_versioning(
             &state.opendal_operator,
+            &state.config,
             &signature.namespace,
             &bucket_name,
         )
@@ -192,16 +193,20 @@ async fn list_object_versions(
             "The specified bucket does not exist.",
         );
     }
-    let versions =
-        match crate::versioning::list_versions(&state.opendal_operator, namespace, &bucket_name)
-            .await
-        {
-            Ok(versions) => versions,
-            Err(error) => {
-                tracing::error!(%error, "failed to list object versions");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    let versions = match crate::versioning::list_versions(
+        &state.opendal_operator,
+        &state.config,
+        namespace,
+        &bucket_name,
+    )
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => {
+            tracing::error!(%error, "failed to list object versions");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let mut latest = HashSet::new();
     let mut versions_output = Vec::new();
     let mut markers_output = Vec::new();

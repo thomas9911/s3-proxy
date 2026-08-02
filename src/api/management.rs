@@ -1,5 +1,5 @@
 use crate::metadata::NamespaceOwner;
-use crate::{metadata::AccessKeyStatus, metrics, templates, AppState};
+use crate::{metadata::AccessKeyStatus, metrics, storage, templates, AppState};
 use askama::Template;
 use aws_sigv4::sign::v4::{calculate_signature, generate_signing_key};
 use axum::extract::{Form, Multipart, Path, Query, State};
@@ -651,7 +651,10 @@ pub async fn management_update_bucket_configuration(
     }
     if !state
         .opendal_operator
-        .exists(&format!("{}/{}/", input.namespace, input.bucket))
+        .exists(
+            &storage::bucket_prefix(&state.config, &input.namespace, &input.bucket)
+                .unwrap_or_default(),
+        )
         .await
         .unwrap_or(false)
     {
@@ -666,6 +669,7 @@ pub async fn management_update_bucket_configuration(
         };
         if let Err(error) = crate::versioning::set_bucket_versioning(
             &state.opendal_operator,
+            &state.config,
             &input.namespace,
             &input.bucket,
             status,
@@ -997,8 +1001,11 @@ async fn list_objects(
     if !valid_bucket_name(&query.bucket) || !valid_object_key(&query.prefix) {
         anyhow::bail!("the bucket or object prefix is invalid")
     }
-    let bucket_path = format!("{}/{}/", query.namespace, query.bucket);
-    if !state.opendal_operator.exists(&bucket_path).await? {
+    let bucket_path = storage::bucket_prefix(&state.config, &query.namespace, &query.bucket)
+        .ok_or_else(|| anyhow::anyhow!("the specified bucket does not exist"))?;
+    if !storage::is_single_bucket(&state.config)
+        && !state.opendal_operator.exists(&bucket_path).await?
+    {
         anyhow::bail!("the specified bucket does not exist")
     }
     let mut lister = state
@@ -1017,6 +1024,9 @@ async fn list_objects(
             .strip_prefix(&bucket_path)
             .unwrap_or(entry.path())
             .to_string();
+        if key == ".s3-proxy" || key.starts_with(".s3-proxy/") {
+            continue;
+        }
         if key.starts_with(&query.prefix) {
             objects.push(templates::ManagementObject {
                 key,
@@ -1050,7 +1060,8 @@ async fn presign_object(
     if access_key.status.as_str() != "Active" {
         anyhow::bail!("the access key is inactive")
     }
-    let path = format!("{}/{}/{}", input.namespace, input.bucket, input.key);
+    let path = storage::object_path(&state.config, &input.namespace, &input.bucket, &input.key)
+        .ok_or_else(|| anyhow::anyhow!("the specified object does not exist"))?;
     if !state.opendal_operator.exists(&path).await? {
         anyhow::bail!("the specified object does not exist")
     }
@@ -1072,7 +1083,8 @@ async fn download_object(state: &AppState, query: DownloadQuery) -> anyhow::Resu
     if !valid_bucket_name(&query.bucket) || query.key.is_empty() || !valid_object_key(&query.key) {
         anyhow::bail!("the bucket or object key is invalid")
     }
-    let path = format!("{}/{}/{}", query.namespace, query.bucket, query.key);
+    let path = storage::object_path(&state.config, &query.namespace, &query.bucket, &query.key)
+        .ok_or_else(|| anyhow::anyhow!("the specified object does not exist"))?;
     let metadata = state.opendal_operator.stat(&path).await?;
     if !metadata.is_file() {
         anyhow::bail!("the specified object does not exist")
@@ -1194,7 +1206,20 @@ async fn multipart_uploads(
             anyhow::bail!("the bucket is invalid")
         }
     }
-    let prefix = format!("{}/.multipart/", query.namespace);
+    let bucket = query
+        .bucket
+        .as_deref()
+        .or_else(|| {
+            state
+                .config
+                .single_bucket
+                .as_ref()
+                .filter(|single| single.namespace == query.namespace)
+                .map(|single| single.name.as_str())
+        })
+        .unwrap_or_default();
+    let prefix = storage::internal_path(&state.config, &query.namespace, bucket, "multipart/")
+        .ok_or_else(|| anyhow::anyhow!("the specified bucket does not exist"))?;
     if !state.opendal_operator.exists(&prefix).await? {
         return Ok(Vec::new());
     }
@@ -1289,7 +1314,10 @@ async fn presign_post(state: &AppState, input: PresignPostInput) -> anyhow::Resu
     }
     if !state
         .opendal_operator
-        .exists(&format!("{}/{}/", input.namespace, input.bucket))
+        .exists(
+            &storage::bucket_prefix(&state.config, &input.namespace, &input.bucket)
+                .unwrap_or_default(),
+        )
         .await?
     {
         anyhow::bail!("the specified bucket does not exist")
@@ -1352,8 +1380,11 @@ async fn inspect(
             anyhow::bail!("the object key is invalid")
         }
     }
-    let bucket_path = format!("{}/{}/", query.namespace, query.bucket);
-    if !state.opendal_operator.exists(&bucket_path).await? {
+    let bucket_path = storage::bucket_prefix(&state.config, &query.namespace, &query.bucket)
+        .ok_or_else(|| anyhow::anyhow!("the specified bucket does not exist"))?;
+    if !storage::is_single_bucket(&state.config)
+        && !state.opendal_operator.exists(&bucket_path).await?
+    {
         anyhow::bail!("the specified bucket does not exist")
     }
     let bucket_public = state
@@ -1368,6 +1399,7 @@ async fn inspect(
         .await?;
     let versioning = crate::versioning::bucket_versioning(
         &state.opendal_operator,
+        &state.config,
         &query.namespace,
         &query.bucket,
     )
@@ -1416,6 +1448,7 @@ async fn inspect(
         metadata.sort_by(|left, right| left.key.cmp(&right.key));
         let versions = crate::versioning::list_versions(
             &state.opendal_operator,
+            &state.config,
             &query.namespace,
             &query.bucket,
         )

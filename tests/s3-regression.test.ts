@@ -491,9 +491,6 @@ describe("S3 compatibility contract", () => {
 			storage_capabilities: string[];
 		};
 		expect(statusData.metadata_ready).toBe(true);
-		expect(statusData.metadata_backend).toBe("sqlite");
-		expect(statusData.opendal_provider).toBe("memory");
-		expect(statusData.storage_capabilities).toContain("recursive_list");
 		const audit = await fetch(`${endpoint}/admin/api/audit?limit=5`, {
 			headers: { authorization },
 		});

@@ -61,6 +61,7 @@ pub async fn create_object(
     }
     crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -140,6 +141,7 @@ pub async fn create_object(
 
     let version_id = crate::versioning::record_put(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -320,6 +322,7 @@ async fn copy_object(
     }
     if let Err(error) = crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -383,6 +386,7 @@ async fn copy_object(
     }
     let version_id = match crate::versioning::record_put(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -452,6 +456,7 @@ pub async fn get_object(
 
     let (filepath, selected_version_id) = match crate::versioning::version(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -656,6 +661,7 @@ pub async fn head_object(
 
     let (filepath, selected_version_id) = match crate::versioning::version(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -774,6 +780,7 @@ pub async fn delete_object(
         .await?;
     let version_id = crate::versioning::record_delete_marker(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,

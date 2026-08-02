@@ -122,7 +122,10 @@ pub async fn put_bucket(
     if is_versioning {
         if !state
             .opendal_operator
-            .exists(&format!("{}/{}/", signature.namespace, bucket_name))
+            .exists(
+                &storage::bucket_prefix(&state.config, &signature.namespace, &bucket_name)
+                    .expect("validated bucket layout"),
+            )
             .await
             .unwrap_or(false)
         {
@@ -154,6 +157,7 @@ pub async fn put_bucket(
         };
         if let Err(error) = crate::versioning::set_bucket_versioning(
             &state.opendal_operator,
+            &state.config,
             &signature.namespace,
             &bucket_name,
             status,
@@ -232,7 +236,10 @@ async fn create_bucket_inner(
         .create_dir(&format!("{}/", namespace))
         .await?;
     opendal_operator
-        .create_dir(&format!("{}/{}/", namespace, bucket_name))
+        .create_dir(
+            &storage::bucket_prefix(&config, namespace, &bucket_name)
+                .expect("validated bucket layout"),
+        )
         .await?;
 
     if let Some(public) = super::objects::public_acl(&header_map) {
@@ -294,7 +301,8 @@ pub(crate) async fn delete_bucket_inner(
             "The configured single bucket cannot be deleted.",
         ));
     }
-    let bucket_path = format!("{}/{}/", namespace, bucket_name);
+    let bucket_path =
+        storage::bucket_prefix(&config, &namespace, &bucket_name).expect("validated bucket layout");
     if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
@@ -312,6 +320,7 @@ pub(crate) async fn delete_bucket_inner(
     metadata_store
         .delete_bucket_policy(&namespace, &bucket_name)
         .await?;
-    crate::versioning::delete_bucket_state(&opendal_operator, &namespace, &bucket_name).await?;
+    crate::versioning::delete_bucket_state(&opendal_operator, &config, &namespace, &bucket_name)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

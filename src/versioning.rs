@@ -1,3 +1,4 @@
+use crate::Config;
 use base64::Engine as _;
 use opendal::Operator;
 use rand::random;
@@ -44,10 +45,17 @@ struct VersionManifest {
 
 pub async fn bucket_versioning(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
 ) -> anyhow::Result<BucketVersioning> {
-    let path = bucket_config_path(namespace, bucket);
+    let path = crate::storage::internal_path(
+        config,
+        namespace,
+        bucket,
+        &format!("buckets/{}/versioning.json", hex::encode(bucket)),
+    )
+    .expect("validated bucket layout");
     if !operator.exists(&path).await? {
         return Ok(BucketVersioning::Off);
     }
@@ -58,13 +66,20 @@ pub async fn bucket_versioning(
 
 pub async fn set_bucket_versioning(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     status: BucketVersioning,
 ) -> anyhow::Result<()> {
     operator
         .write(
-            &bucket_config_path(namespace, bucket),
+            &crate::storage::internal_path(
+                config,
+                namespace,
+                bucket,
+                &format!("buckets/{}/versioning.json", hex::encode(bucket)),
+            )
+            .expect("validated bucket layout"),
             serde_json::to_vec(&status)?,
         )
         .await?;
@@ -73,14 +88,20 @@ pub async fn set_bucket_versioning(
 
 pub async fn delete_bucket_state(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
 ) -> anyhow::Result<()> {
     let bucket_id = hex::encode(bucket);
     for path in [
-        format!("{namespace}/.s3-proxy/buckets/{bucket_id}/"),
-        format!("{namespace}/.s3-proxy/versions/{bucket_id}/"),
-        format!("{namespace}/.s3-proxy/version-data/{bucket_id}/"),
+        internal_path(config, namespace, bucket, &format!("buckets/{bucket_id}/")),
+        internal_path(config, namespace, bucket, &format!("versions/{bucket_id}/")),
+        internal_path(
+            config,
+            namespace,
+            bucket,
+            &format!("version-data/{bucket_id}/"),
+        ),
     ] {
         if operator.exists(&path).await? {
             operator.delete_with(&path).recursive(true).await?;
@@ -91,12 +112,13 @@ pub async fn delete_bucket_state(
 
 pub async fn record_put(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
     current_path: &str,
 ) -> anyhow::Result<Option<String>> {
-    let status = bucket_versioning(operator, namespace, bucket).await?;
+    let status = bucket_versioning(operator, config, namespace, bucket).await?;
     if status == BucketVersioning::Off {
         return Ok(None);
     }
@@ -105,9 +127,9 @@ pub async fn record_put(
         BucketVersioning::Suspended => "null".to_string(),
         BucketVersioning::Off => unreachable!(),
     };
-    let data_path = version_data_path(namespace, bucket, object, &version_id);
+    let data_path = version_data_path(config, namespace, bucket, object, &version_id);
     copy(operator, current_path, &data_path).await?;
-    let mut manifest = object_manifest(operator, namespace, bucket, object).await?;
+    let mut manifest = object_manifest(operator, config, namespace, bucket, object).await?;
     manifest
         .versions
         .retain(|version| version.version_id != version_id);
@@ -120,28 +142,29 @@ pub async fn record_put(
             data_path: Some(data_path),
         },
     );
-    write_manifest(operator, namespace, bucket, object, &manifest).await?;
+    write_manifest(operator, config, namespace, bucket, object, &manifest).await?;
     Ok(Some(version_id))
 }
 
 pub async fn prepare_overwrite(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
     current_path: &str,
 ) -> anyhow::Result<()> {
-    if bucket_versioning(operator, namespace, bucket).await? == BucketVersioning::Off
+    if bucket_versioning(operator, config, namespace, bucket).await? == BucketVersioning::Off
         || !operator.exists(current_path).await?
     {
         return Ok(());
     }
-    let mut manifest = object_manifest(operator, namespace, bucket, object).await?;
+    let mut manifest = object_manifest(operator, config, namespace, bucket, object).await?;
     if !manifest.versions.is_empty() {
         return Ok(());
     }
     let version_id = "null";
-    let data_path = version_data_path(namespace, bucket, object, version_id);
+    let data_path = version_data_path(config, namespace, bucket, object, version_id);
     copy(operator, current_path, &data_path).await?;
     manifest.versions.push(ObjectVersion {
         version_id: version_id.to_string(),
@@ -149,16 +172,17 @@ pub async fn prepare_overwrite(
         created_at: now(),
         data_path: Some(data_path),
     });
-    write_manifest(operator, namespace, bucket, object, &manifest).await
+    write_manifest(operator, config, namespace, bucket, object, &manifest).await
 }
 
 pub async fn record_delete_marker(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
 ) -> anyhow::Result<Option<String>> {
-    let status = bucket_versioning(operator, namespace, bucket).await?;
+    let status = bucket_versioning(operator, config, namespace, bucket).await?;
     if status == BucketVersioning::Off {
         return Ok(None);
     }
@@ -167,7 +191,7 @@ pub async fn record_delete_marker(
         BucketVersioning::Suspended => "null".to_string(),
         BucketVersioning::Off => unreachable!(),
     };
-    let mut manifest = object_manifest(operator, namespace, bucket, object).await?;
+    let mut manifest = object_manifest(operator, config, namespace, bucket, object).await?;
     manifest
         .versions
         .retain(|version| version.version_id != version_id);
@@ -180,18 +204,19 @@ pub async fn record_delete_marker(
             data_path: None,
         },
     );
-    write_manifest(operator, namespace, bucket, object, &manifest).await?;
+    write_manifest(operator, config, namespace, bucket, object, &manifest).await?;
     Ok(Some(version_id))
 }
 
 pub async fn version(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
     version_id: Option<&str>,
 ) -> anyhow::Result<Option<ObjectVersion>> {
-    let manifest = object_manifest(operator, namespace, bucket, object).await?;
+    let manifest = object_manifest(operator, config, namespace, bucket, object).await?;
     Ok(match version_id {
         Some(version_id) => manifest
             .versions
@@ -203,10 +228,11 @@ pub async fn version(
 
 pub async fn list_versions(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
 ) -> anyhow::Result<Vec<(String, ObjectVersion)>> {
-    let prefix = version_manifest_prefix(namespace, bucket);
+    let prefix = version_manifest_prefix(config, namespace, bucket);
     if !operator.exists(&prefix).await? {
         return Ok(Vec::new());
     }
@@ -232,40 +258,55 @@ pub async fn list_versions(
     Ok(versions)
 }
 
-fn bucket_config_path(namespace: &str, bucket: &str) -> String {
-    format!(
-        "{namespace}/.s3-proxy/buckets/{}/versioning.json",
-        hex::encode(bucket)
+fn internal_path(config: &Config, namespace: &str, bucket: &str, suffix: &str) -> String {
+    crate::storage::internal_path(config, namespace, bucket, suffix)
+        .expect("validated bucket layout")
+}
+
+fn version_manifest_prefix(config: &Config, namespace: &str, bucket: &str) -> String {
+    internal_path(
+        config,
+        namespace,
+        bucket,
+        &format!("versions/{}/", hex::encode(bucket)),
     )
 }
 
-fn version_manifest_prefix(namespace: &str, bucket: &str) -> String {
-    format!("{namespace}/.s3-proxy/versions/{}/", hex::encode(bucket))
-}
-
-fn object_manifest_path(namespace: &str, bucket: &str, object: &str) -> String {
+fn object_manifest_path(config: &Config, namespace: &str, bucket: &str, object: &str) -> String {
     format!(
         "{}{}.json",
-        version_manifest_prefix(namespace, bucket),
+        version_manifest_prefix(config, namespace, bucket),
         hex::encode(object)
     )
 }
 
-fn version_data_path(namespace: &str, bucket: &str, object: &str, version_id: &str) -> String {
-    format!(
-        "{namespace}/.s3-proxy/version-data/{}/{}/{version_id}",
-        hex::encode(bucket),
-        hex::encode(object),
+fn version_data_path(
+    config: &Config,
+    namespace: &str,
+    bucket: &str,
+    object: &str,
+    version_id: &str,
+) -> String {
+    internal_path(
+        config,
+        namespace,
+        bucket,
+        &format!(
+            "version-data/{}/{}/{version_id}",
+            hex::encode(bucket),
+            hex::encode(object),
+        ),
     )
 }
 
 async fn object_manifest(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
 ) -> anyhow::Result<VersionManifest> {
-    let path = object_manifest_path(namespace, bucket, object);
+    let path = object_manifest_path(config, namespace, bucket, object);
     if !operator.exists(&path).await? {
         return Ok(VersionManifest::default());
     }
@@ -276,6 +317,7 @@ async fn object_manifest(
 
 async fn write_manifest(
     operator: &Operator,
+    config: &Config,
     namespace: &str,
     bucket: &str,
     object: &str,
@@ -283,7 +325,7 @@ async fn write_manifest(
 ) -> anyhow::Result<()> {
     operator
         .write(
-            &object_manifest_path(namespace, bucket, object),
+            &object_manifest_path(config, namespace, bucket, object),
             serde_json::to_vec(manifest)?,
         )
         .await?;
@@ -324,15 +366,42 @@ mod tests {
     use opendal::services::Memory;
     use opendal::Operator;
 
+    fn config() -> crate::Config {
+        crate::Config {
+            server_host: String::new(),
+            external_server_host: String::new(),
+            max_request_body_bytes: 0,
+            metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            redis: None,
+            sqlite: None,
+            postgres: None,
+            admin: None,
+            #[cfg(feature = "management")]
+            management: None,
+            quotas: Default::default(),
+            opendal_provider: String::new(),
+            opendal: Default::default(),
+            storage_layout: crate::StorageLayout::Namespaced,
+            single_bucket: None,
+        }
+    }
+
     #[tokio::test]
     async fn persists_object_versions_and_delete_markers() {
         let operator = Operator::new(Memory::default()).unwrap();
+        let config = config();
         operator.create_dir("principal/bucket/").await.unwrap();
-        set_bucket_versioning(&operator, "principal", "bucket", BucketVersioning::Enabled)
-            .await
-            .unwrap();
+        set_bucket_versioning(
+            &operator,
+            &config,
+            "principal",
+            "bucket",
+            BucketVersioning::Enabled,
+        )
+        .await
+        .unwrap();
         assert_eq!(
-            bucket_versioning(&operator, "principal", "bucket")
+            bucket_versioning(&operator, &config, "principal", "bucket")
                 .await
                 .unwrap(),
             BucketVersioning::Enabled
@@ -343,6 +412,7 @@ mod tests {
             .unwrap();
         let first = record_put(
             &operator,
+            &config,
             "principal",
             "bucket",
             "key",
@@ -357,6 +427,7 @@ mod tests {
             .unwrap();
         let second = record_put(
             &operator,
+            &config,
             "principal",
             "bucket",
             "key",
@@ -366,10 +437,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_ne!(first, second);
-        let first_version = version(&operator, "principal", "bucket", "key", Some(&first))
-            .await
-            .unwrap()
-            .unwrap();
+        let first_version = version(
+            &operator,
+            &config,
+            "principal",
+            "bucket",
+            "key",
+            Some(&first),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             operator
                 .read(&first_version.data_path.unwrap())
@@ -378,37 +456,58 @@ mod tests {
                 .to_vec(),
             b"first"
         );
-        let marker = record_delete_marker(&operator, "principal", "bucket", "key")
+        let marker = record_delete_marker(&operator, &config, "principal", "bucket", "key")
             .await
             .unwrap()
             .unwrap();
-        let marker = version(&operator, "principal", "bucket", "key", Some(&marker))
-            .await
-            .unwrap()
-            .unwrap();
+        let marker = version(
+            &operator,
+            &config,
+            "principal",
+            "bucket",
+            "key",
+            Some(&marker),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(marker.is_delete_marker);
     }
 
     #[tokio::test]
     async fn preserves_pre_versioning_object_as_null_version() {
         let operator = Operator::new(Memory::default()).unwrap();
+        let config = config();
         operator.create_dir("principal/bucket/").await.unwrap();
         let current = "principal/bucket/key";
         operator.write(current, b"before".to_vec()).await.unwrap();
-        set_bucket_versioning(&operator, "principal", "bucket", BucketVersioning::Enabled)
-            .await
-            .unwrap();
-        prepare_overwrite(&operator, "principal", "bucket", "key", current)
+        set_bucket_versioning(
+            &operator,
+            &config,
+            "principal",
+            "bucket",
+            BucketVersioning::Enabled,
+        )
+        .await
+        .unwrap();
+        prepare_overwrite(&operator, &config, "principal", "bucket", "key", current)
             .await
             .unwrap();
         operator.write(current, b"after".to_vec()).await.unwrap();
-        record_put(&operator, "principal", "bucket", "key", current)
+        record_put(&operator, &config, "principal", "bucket", "key", current)
             .await
             .unwrap();
-        let null_version = version(&operator, "principal", "bucket", "key", Some("null"))
-            .await
-            .unwrap()
-            .unwrap();
+        let null_version = version(
+            &operator,
+            &config,
+            "principal",
+            "bucket",
+            "key",
+            Some("null"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(
             operator
                 .read(&null_version.data_path.unwrap())
