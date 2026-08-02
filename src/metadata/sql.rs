@@ -712,6 +712,7 @@ fn access_key_from_row(
 }
 
 pub type SqliteMetadataStore = SqlMetadataStore;
+#[cfg(feature = "postgres")]
 pub type PostgresMetadataStore = SqlMetadataStore;
 
 #[cfg(test)]

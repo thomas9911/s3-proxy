@@ -2,25 +2,33 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "redis")]
 mod redis;
 mod sql;
 
+#[cfg(feature = "redis")]
 pub use redis::RedisMetadataStore;
-pub use sql::{PostgresMetadataStore, SqliteMetadataStore};
+#[cfg(feature = "postgres")]
+pub use sql::PostgresMetadataStore;
+pub use sql::SqliteMetadataStore;
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetaDataBackend {
-    Redis,
     Sqlite,
+    #[cfg(feature = "redis")]
+    Redis,
+    #[cfg(feature = "postgres")]
     Postgres,
 }
 
 impl MetaDataBackend {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Redis => "redis",
             Self::Sqlite => "sqlite",
+            #[cfg(feature = "redis")]
+            Self::Redis => "redis",
+            #[cfg(feature = "postgres")]
             Self::Postgres => "postgres",
         }
     }

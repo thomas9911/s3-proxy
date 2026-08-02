@@ -1,6 +1,25 @@
-version: "3.8"
 services:
-  metadata:
-    image: redis:latest
+  s3-proxy:
+    build:
+      context: .
+      args:
+        - CARGO_ARG=--no-default-features
+        - CARGO_BUILD_JOBS=16
+    environment:
+      S3_PROXY__SERVER_HOST: "0.0.0.0:3000"
+      S3_PROXY__EXTERNAL_SERVER_HOST: "http://localhost:3000"
+      S3_PROXY__METADATA_BACKEND: sqlite
+      S3_PROXY__SQLITE__URL: "sqlite::memory:"
+      S3_PROXY__OPENDAL_PROVIDER: fs
+      S3_PROXY__OPENDAL__ROOT: /opt/app/data
+      S3_PROXY__STORAGE_LAYOUT: single_bucket
+      S3_PROXY__SINGLE_BUCKET__NAMESPACE: admin
+      S3_PROXY__SINGLE_BUCKET__NAME: storage
+      S3_PROXY__ADMIN__ACCESS_KEY: admin
+      S3_PROXY__ADMIN__SECRET_KEY: admin-secret-key-change-me
+      S3_PROXY__MANAGEMENT__USERNAME: admin
+      S3_PROXY__MANAGEMENT__PASSWORD: management-password-change-me
     ports:
-      - 6379:6379
+      - 3000:3000
+    volumes:
+       - ./data:/opt/app/data

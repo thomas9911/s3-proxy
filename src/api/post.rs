@@ -1278,6 +1278,7 @@ mod tests {
             external_server_host: "http://127.0.0.1:0".to_string(),
             max_request_body_bytes: 256 * 1024 * 1024,
             metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            #[cfg(feature = "redis")]
             redis: None,
             sqlite: Some(SqliteConfig {
                 url: "sqlite::memory:".to_string(),
