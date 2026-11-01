@@ -27,8 +27,13 @@ if (externalEndpoint) {
 		S3_TEST_ENDPOINT: externalEndpoint,
 	});
 } else {
-	run("MinIO in Docker", {
-		S3_TEST_TARGET: "minio",
+  run("MinIO in Docker", {
+    S3_TEST_TARGET: "minio",
+    S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
+  });
+
+  run("rustfs in Docker", {
+    S3_TEST_TARGET: "rustfs",
 		S3_TEST_ENDPOINT: "http://127.0.0.1:19000",
 	});
 }

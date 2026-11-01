@@ -95,6 +95,11 @@ stored under `.s3-proxy/` and is excluded from object listings.
 
 ## Operations
 
+To run the compatibility contract against RustFS instead of MinIO, set
+`S3_TEST_TARGET=rustfs` before running `bun run regression`. The test harness
+starts `rustfs/rustfs:latest` in Docker; set `S3_TEST_RUSTFS_IMAGE` to select a
+different image or pin a version.
+
 ## Build profiles
 
 The default build includes the management UI, Redis and PostgreSQL metadata

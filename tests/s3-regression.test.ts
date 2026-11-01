@@ -328,8 +328,19 @@ async function startTarget() {
 		return;
 	}
 
-	if (target !== "minio") throw new Error(`unknown S3_TEST_TARGET: ${target}`);
+	if (target !== "minio" && target !== "rustfs") throw new Error(`unknown S3_TEST_TARGET: ${target}`);
 	run(["docker", "rm", "-f", containerName], { check: false });
+	if (target === "rustfs") {
+		run([
+			"docker", "run", "--detach", "--name", containerName,
+			"--publish", "19000:9000", "--env", `RUSTFS_ACCESS_KEY=${accessKeyId}`,
+			"--env", `RUSTFS_SECRET_KEY=${secretAccessKey}`, "--env", "RUSTFS_ADDRESS=0.0.0.0:9000",
+			process.env.S3_TEST_RUSTFS_IMAGE ?? "rustfs/rustfs:latest", "/data",
+		]);
+		ownsContainer = true;
+		await waitForEndpoint();
+		return;
+	}
 	run([
 		"docker",
 		"run",
@@ -349,6 +360,10 @@ async function startTarget() {
 }
 
 function reportTargetVersion() {
+	if (target === "rustfs") {
+		console.log(`[s3-regression] target=rustfs image=${process.env.S3_TEST_RUSTFS_IMAGE ?? "rustfs/rustfs:latest"}`);
+		return;
+	}
 	if (target === "minio") {
 		const version = run(
 			["docker", "exec", containerName, "minio", "--version"],
