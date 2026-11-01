@@ -1,0 +1,11 @@
+.git
+.gitignore
+target
+node_modules
+tests
+scripts
+rclone.exe
+*.info
+AGENTS.md
+IDEA.md
+TODO.md

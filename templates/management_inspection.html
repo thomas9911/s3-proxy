@@ -1,0 +1,7 @@
+<h3>{{ inspection.namespace }}/{{ inspection.bucket }}{% match inspection.key %}{% when Some with (key) %}/{{ key }}{% when None %}{% endmatch %}</h3>
+<p>Bucket visibility: {% if inspection.bucket_public %}<strong class="ok">public</strong>{% else %}<strong>private</strong>{% endif %}. Versioning: <strong>{{ inspection.versioning }}</strong>.</p>
+{% match inspection.object_public %}{% when Some with (public) %}<p>Object visibility: {% if public %}<strong class="ok">public</strong>{% else %}<strong>private</strong>{% endif %}.</p>{% when None %}{% endmatch %}
+<h4>Bucket policy</h4>
+{% match inspection.bucket_policy %}{% when Some with (policy) %}<pre>{{ policy }}</pre>{% when None %}<p>No bucket policy.</p>{% endmatch %}
+{% if inspection.metadata.len() > 0 %}<h4>Object metadata</h4><table><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>{% for item in inspection.metadata %}<tr><td>{{ item.key }}</td><td>{{ item.value }}</td></tr>{% endfor %}</tbody></table>{% endif %}
+{% if inspection.versions.len() > 0 %}<h4>Versions</h4><table><thead><tr><th>ID</th><th>Created</th><th>Delete marker</th></tr></thead><tbody>{% for version in inspection.versions %}<tr><td><code>{{ version.id }}</code></td><td>{{ version.created_at }}</td><td>{{ version.delete_marker }}</td></tr>{% endfor %}</tbody></table>{% endif %}

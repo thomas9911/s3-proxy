@@ -1,0 +1,7 @@
+{% if buckets.len() == 0 %}
+<tr><td colspan="2">No buckets</td></tr>
+{% else %}
+{% for bucket in buckets %}
+<tr><td>{{ bucket.namespace }}</td><td>{{ bucket.name }}</td><td><form hx-delete="/admin/api/buckets" hx-confirm="Delete this bucket and all of its objects?"><input type="hidden" name="namespace" value="{{ bucket.namespace }}"><input type="hidden" name="name" value="{{ bucket.name }}"><input type="hidden" name="confirm" value="true"><button type="submit">Delete</button></form></td></tr>
+{% endfor %}
+{% endif %}

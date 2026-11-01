@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>S3 Proxy Management</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #162b32;
+      --muted: #5e6f70;
+      --paper: #fffdf7;
+      --canvas: #e8e1d1;
+      --line: #d7cbb7;
+      --accent: #d2643e;
+      --accent-dark: #a94127;
+      --sea: #4a7c7b;
+      --code: #193238;
+      --success: #27765d;
+      --danger: #b84b3d;
+      font-family: "Aptos", "Trebuchet MS", sans-serif;
+      color: var(--ink);
+      background: var(--canvas);
+    }
+    * { box-sizing: border-box; }
+    body { max-width: 1240px; margin: 0 auto; padding: 2rem 1.25rem 4rem; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1, h2, h3 { font-family: Georgia, "Times New Roman", serif; color: var(--ink); }
+    h1 { font-size: clamp(2.5rem, 8vw, 5.5rem); letter-spacing: -.07em; line-height: .86; margin: 0; }
+    h2 { font-size: 1.45rem; margin-bottom: .25rem; }
+    h3 { font-size: 1.1rem; }
+    p { color: var(--muted); line-height: 1.45; }
+    .masthead { display: grid; grid-template-columns: 1.2fr .8fr; gap: 2rem; align-items: end; padding: 2.25rem; background: var(--ink); color: var(--paper); border-radius: 1.25rem; box-shadow: 0 18px 45px rgba(31, 44, 45, .18); }
+    .masthead h1 { color: var(--paper); }
+    .masthead p { color: #dce8e3; margin: .85rem 0 0; max-width: 42rem; }
+    .eyebrow { color: #f3ad71; font-size: .75rem; font-weight: 800; letter-spacing: .15em; text-transform: uppercase; }
+    .masthead-note { border-left: 1px solid rgba(255,255,255,.25); padding-left: 1.25rem; font-size: .92rem; }
+    .status-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; margin: 1.5rem 0; }
+    .status-grid section { margin: 0; }
+    section, .panel { background: var(--paper); border: 1px solid var(--line); border-radius: 1rem; padding: 1.4rem; margin-top: 1.25rem; box-shadow: 0 4px 15px rgba(66, 59, 43, .05); }
+    .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; margin-bottom: 1rem; }
+    .section-heading p { margin: 0; font-size: .9rem; }
+    .form-stack { display: grid; gap: .8rem; }
+    .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr)); gap: .75rem; align-items: end; padding: .9rem; border: 1px solid #e5ddcf; border-radius: .7rem; background: #fffcf5; }
+    .form-row.compact { grid-template-columns: minmax(13rem, 1fr) auto; }
+    label { display: grid; gap: .35rem; color: var(--muted); font-size: .78rem; font-weight: 800; letter-spacing: .02em; }
+    input, select, textarea, button { font: inherit; font-size: .95rem; }
+    input, select, textarea { width: 100%; min-height: 2.55rem; padding: .55rem .65rem; border: 1px solid #bfb5a4; border-radius: .45rem; color: var(--ink); background: #fffefa; }
+    input[type="checkbox"] { width: 1.15rem; min-height: 1.15rem; padding: 0; accent-color: var(--sea); }
+    textarea { min-height: 5.5rem; resize: vertical; }
+    input:focus, select:focus, textarea:focus { outline: 3px solid rgba(74,124,123,.22); border-color: var(--sea); }
+    button { min-height: 2.55rem; padding: .55rem .9rem; border: 0; border-radius: .45rem; background: var(--ink); color: var(--paper); font-weight: 800; cursor: pointer; transition: transform .12s ease, background .12s ease; }
+    button:hover { background: var(--sea); transform: translateY(-1px); }
+    .danger button, button.danger { background: var(--danger); }
+    .danger button:hover, button.danger:hover { background: #92372d; }
+    .accent button { background: var(--accent); }
+    .accent button:hover { background: var(--accent-dark); }
+    .button-row { display: flex; flex-wrap: wrap; gap: .65rem; }
+    .button-row button { flex: 1 1 12rem; }
+    .result { margin: .8rem 0 0; max-height: 16rem; overflow: auto; white-space: pre-wrap; word-break: break-word; background: var(--code); color: #dce9df; border-radius: .65rem; padding: .85rem 1rem; font: .78rem/1.45 "Cascadia Mono", Consolas, monospace; }
+    .table-wrap { overflow-x: auto; border: 1px solid #e3dacb; border-radius: .65rem; }
+    table { width: 100%; border-collapse: collapse; min-width: 38rem; }
+    th, td { padding: .8rem .9rem; text-align: left; border-bottom: 1px solid #e7dfd1; vertical-align: middle; }
+    tr:last-child td { border-bottom: 0; }
+    th { color: var(--muted); font-size: .7rem; letter-spacing: .11em; text-transform: uppercase; background: #f7f1e6; }
+    td code, code { color: #91442c; font: .83rem "Cascadia Mono", Consolas, monospace; }
+    td form { margin: 0; }
+    td button { min-height: 2rem; padding: .35rem .65rem; font-size: .78rem; }
+    .ok { color: var(--success); } .bad { color: var(--danger); }
+    .metrics { grid-column: 1 / -1; margin: 0; }
+    .metrics pre { margin: .75rem 0 0; }
+    .two-column { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
+    .divider { height: 1px; background: var(--line); margin: 1rem 0; }
+    @media (max-width: 760px) {
+      body { padding: 1rem .75rem 3rem; }
+      .masthead { grid-template-columns: 1fr; padding: 1.5rem; gap: 1rem; }
+      .masthead-note { border-left: 0; border-top: 1px solid rgba(255,255,255,.25); padding: 1rem 0 0; }
+      .two-column, .status-grid { grid-template-columns: 1fr; }
+      section, .panel { padding: 1rem; }
+      .form-row.compact { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="masthead">
+    <div><div class="eyebrow">Object storage control room</div><h1>S3 Proxy</h1><p>Manage storage, credentials, policies, and operational controls from one place.</p></div>
+    <p class="masthead-note">Access-key secrets are deliberately never shown in this dashboard. Newly created or rotated keys are returned once in the operation response.</p>
+  </header>
+
+  <div class="status-grid" hx-get="/admin/fragments/status" hx-trigger="load, every 15s" hx-swap="innerHTML">Loading service status...</div>
+
+  <section><div class="section-heading"><div><h2>Operations</h2><p>Inspect current traffic and service instrumentation.</p></div></div><div class="button-row"><button hx-get="/admin/api/audit?limit=50" hx-target="#audit-result" hx-swap="innerHTML">Load audit log</button><button hx-get="/admin/api/metrics" hx-target="#metrics-result" hx-swap="innerHTML">Load metrics</button></div><pre id="audit-result" class="result">Recent request audit events appear here as JSON.</pre><pre id="metrics-result" class="result">Prometheus metrics appear here.</pre></section>
+
+  <section><div class="section-heading"><div><h2>Principals</h2><p>Namespaces and their access keys.</p></div></div><div class="table-wrap"><table><thead><tr><th>Principal</th><th>Namespace</th><th>Access keys</th></tr></thead><tbody hx-get="/admin/fragments/principals" hx-trigger="load, every 30s" hx-swap="innerHTML"><tr><td colspan="3">Loading...</td></tr></tbody></table></div></section>
+
+  <section><div class="section-heading"><div><h2>Access keys</h2><p>Create credentials, change their state, rotate, or remove them.</p></div></div><div class="form-stack">
+    <form class="form-row accent" hx-post="/admin/api/access-keys" hx-target="#access-key-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><button type="submit">Create key</button></form>
+    <form class="form-row" hx-patch="/admin/api/access-keys" hx-target="#access-key-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Access key <select name="access_key" required>{% for principal in principals %}{% for key in principal.access_keys %}<option value="{{ key.id }}">{{ key.id }} ({{ principal.namespace }})</option>{% endfor %}{% endfor %}</select></label><label>Status <select name="status"><option>Active</option><option>Inactive</option></select></label><button type="submit">Update status</button></form>
+    <form class="form-row" hx-post="/admin/api/access-keys/rotate" hx-target="#access-key-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Access key <select name="access_key" required>{% for principal in principals %}{% for key in principal.access_keys %}<option value="{{ key.id }}">{{ key.id }} ({{ principal.namespace }})</option>{% endfor %}{% endfor %}</select></label><button type="submit">Rotate key</button></form>
+    <form class="form-row danger" hx-delete="/admin/api/access-keys" hx-confirm="Delete this access key?" hx-target="#access-key-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Access key <select name="access_key" required>{% for principal in principals %}{% for key in principal.access_keys %}<option value="{{ key.id }}">{{ key.id }} ({{ principal.namespace }})</option>{% endfor %}{% endfor %}</select></label><input type="hidden" name="confirm" value="true"><button type="submit">Delete key</button></form>
+  </div><pre id="access-key-result" class="result">Access-key results appear here.</pre></section>
+
+  <section><div class="section-heading"><div><h2>Quotas</h2><p>View usage and set runtime limits per principal.</p></div></div><div class="form-stack"><form class="form-row compact" hx-get="/admin/api/quotas" hx-target="#quota-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><button type="submit">View usage</button></form><form class="form-row" hx-post="/admin/api/quotas" hx-target="#quota-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Maximum storage bytes <input name="max_storage_bytes" type="number" min="1" placeholder="Unlimited"></label><label>Maximum requests/minute <input name="max_requests_per_minute" type="number" min="1" placeholder="Unlimited"></label><button type="submit">Set quota</button></form></div><pre id="quota-result" class="result">Quota usage and limits appear here as JSON.</pre></section>
+
+  <section><div class="section-heading"><div><h2>Multipart uploads</h2><p>Find in-progress uploads or remove stale manifests.</p></div></div><div class="form-stack"><form class="form-row" hx-get="/admin/api/multipart-uploads" hx-target="#multipart-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket filter <input name="bucket" placeholder="All buckets"></label><button type="submit">List uploads</button></form><form class="form-row danger" hx-delete="/admin/api/multipart-uploads" hx-confirm="Abort this multipart upload?" hx-target="#multipart-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Upload ID <input name="upload_id" required></label><input type="hidden" name="confirm" value="true"><button type="submit">Abort upload</button></form><form class="form-row danger" hx-delete="/admin/api/multipart-uploads" hx-confirm="Abort all stale uploads matching this filter?" hx-target="#multipart-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket filter <input name="bucket" placeholder="All buckets"></label><label>Older than seconds <input name="older_than_seconds" type="number" min="1" required></label><input type="hidden" name="confirm" value="true"><button type="submit">Abort stale uploads</button></form></div><pre id="multipart-result" class="result">Multipart uploads appear here as JSON.</pre></section>
+
+  <section><div class="section-heading"><div><h2>Buckets</h2><p>Create, filter, and remove buckets.</p></div></div><div class="form-stack"><form class="form-row accent" hx-post="/admin/fragments/buckets" hx-target="#bucket-list" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket name <input name="name" pattern="[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]" required></label><button type="submit">Create bucket</button></form><form class="form-row compact" hx-get="/admin/fragments/buckets" hx-target="#bucket-list" hx-swap="innerHTML"><label>Bucket prefix <input name="prefix" placeholder="Filter by prefix"></label><button type="submit">Filter buckets</button></form></div><div class="table-wrap"><table><thead><tr><th>Namespace</th><th>Bucket</th><th></th></tr></thead><tbody id="bucket-list" hx-get="/admin/fragments/buckets" hx-trigger="load, every 30s" hx-swap="innerHTML"><tr><td colspan="3">Loading...</td></tr></tbody></table></div></section>
+
+  <section><div class="section-heading"><div><h2>Files</h2><p>Browse object keys before downloading, inspecting, or deleting.</p></div></div><form class="form-row" hx-get="/admin/fragments/objects" hx-target="#object-list" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Prefix <input name="prefix" placeholder="Optional path prefix"></label><button type="submit">List files</button></form><div class="table-wrap"><table><thead><tr><th>Key</th><th>Bytes</th><th></th></tr></thead><tbody id="object-list"><tr><td colspan="3">Choose a bucket to list files.</td></tr></tbody></table></div></section>
+
+  <div class="two-column">
+    <section><div class="section-heading"><div><h2>Upload</h2><p>Upload an object directly through the management API.</p></div></div><form class="form-stack" action="/admin/api/objects" method="post" enctype="multipart/form-data"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Object key <input name="key" required></label><label>File <input name="file" type="file" required></label><button type="submit">Upload file</button></form></section>
+    <section><div class="section-heading"><div><h2>Inspect</h2><p>Review object metadata, visibility, policy, and versions.</p></div></div><form class="form-stack" hx-get="/admin/fragments/inspect" hx-target="#inspection" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Object key <input name="key" placeholder="Leave empty for bucket details"></label><button type="submit">Inspect</button></form><div id="inspection" class="panel">Choose a bucket or object to inspect.</div></section>
+  </div>
+
+  <section><div class="section-heading"><div><h2>Bucket configuration</h2><p>Set versioning and replace or remove the bucket policy.</p></div></div><form class="form-row" hx-post="/admin/api/bucket-configuration" hx-target="#bucket-configuration-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Versioning <select name="versioning"><option value="">Unchanged</option><option>Off</option><option>Enabled</option><option>Suspended</option></select></label><label>Bucket policy JSON <textarea name="policy" placeholder="Optional policy document"></textarea></label><label>Clear policy <input name="clear_policy" type="checkbox" value="true"></label><button type="submit">Apply configuration</button></form><pre id="bucket-configuration-result" class="result">Configuration result appears here.</pre></section>
+
+  <div class="two-column">
+    <section><div class="section-heading"><div><h2>Presigned download</h2><p>Create a time-limited URL for a stored object.</p></div></div><form class="form-stack" hx-post="/admin/api/presigned-urls" hx-target="#presigned-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Object key <input name="key" required></label><label>Active access key <select name="access_key" required>{% for principal in principals %}{% for key in principal.access_keys %}{% if key.status == "Active" %}<option value="{{ key.id }}">{{ key.id }} ({{ principal.namespace }})</option>{% endif %}{% endfor %}{% endfor %}</select></label><label>Expires in seconds <input name="expires_in" type="number" min="1" max="604800" value="3600" required></label><button type="submit">Generate URL</button></form><pre id="presigned-result" class="result">Generated URL appears here as JSON.</pre></section>
+    <section><div class="section-heading"><div><h2>Download</h2><p>Download an object using your management session.</p></div></div><form class="form-stack" action="/admin/api/download" method="get"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Object key <input name="key" required></label><button type="submit">Download file</button></form></section>
+  </div>
+
+  <section><div class="section-heading"><div><h2>Presigned upload form</h2><p>Generate browser-upload fields scoped to a key prefix and size limit.</p></div></div><form class="form-row" hx-post="/admin/api/presigned-posts" hx-target="#presigned-post-result" hx-swap="innerHTML"><label>Principal namespace <select name="namespace" required>{% for principal in principals %}<option value="{{ principal.namespace }}">{{ principal.display_name }} ({{ principal.namespace }})</option>{% endfor %}</select></label><label>Bucket <select name="bucket" required>{% for bucket in buckets %}<option value="{{ bucket.name }}">{{ bucket.namespace }}/{{ bucket.name }}</option>{% endfor %}</select></label><label>Key prefix <input name="prefix" value="uploads/"></label><label>Active access key <select name="access_key" required>{% for principal in principals %}{% for key in principal.access_keys %}{% if key.status == "Active" %}<option value="{{ key.id }}">{{ key.id }} ({{ principal.namespace }})</option>{% endif %}{% endfor %}{% endfor %}</select></label><label>Expires in seconds <input name="expires_in" type="number" min="1" max="604800" value="3600" required></label><label>Maximum bytes <input name="max_size" type="number" min="1" value="104857600" required></label><button type="submit">Generate form</button></form><pre id="presigned-post-result" class="result">Generated POST form appears here as JSON.</pre></section>
+
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script>
+    function syncBucketChoices(form) {
+      const namespace = form.elements.namedItem("namespace");
+      const bucket = form.elements.namedItem("bucket");
+      if (!(namespace instanceof HTMLSelectElement) || !(bucket instanceof HTMLSelectElement)) return;
+
+      const prefix = `${namespace.value}/`;
+      for (const option of bucket.options) {
+        const matchesNamespace = option.textContent.startsWith(prefix);
+        option.hidden = !matchesNamespace;
+        option.disabled = !matchesNamespace;
+      }
+      if (bucket.selectedOptions[0]?.disabled) {
+        const firstAvailable = [...bucket.options].find((option) => !option.disabled);
+        if (firstAvailable) bucket.value = firstAvailable.value;
+      }
+    }
+
+    document.querySelectorAll("form").forEach((form) => {
+      syncBucketChoices(form);
+      form.elements.namedItem("namespace")?.addEventListener("change", () => syncBucketChoices(form));
+    });
+
+    const uploadForm = document.querySelector('form[action="/admin/api/objects"]');
+    const fileInput = uploadForm?.elements.namedItem("file");
+    const keyInput = uploadForm?.elements.namedItem("key");
+    fileInput?.addEventListener("change", () => {
+      if (fileInput instanceof HTMLInputElement && keyInput instanceof HTMLInputElement && fileInput.files?.[0]) {
+        keyInput.value = fileInput.files[0].name;
+      }
+    });
+  </script>
+</body>
+</html>

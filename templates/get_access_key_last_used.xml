@@ -1,0 +1,10 @@
+<GetAccessKeyLastUsedResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">
+  <GetAccessKeyLastUsedResult>
+    <UserName>{{ user_name }}</UserName>
+    <AccessKeyLastUsed>
+      <ServiceName>s3</ServiceName>
+{% if let Some(last_used_at) = last_used_at %}      <LastUsedDate>{{ last_used_at }}</LastUsedDate>
+{% endif %}    </AccessKeyLastUsed>
+  </GetAccessKeyLastUsedResult>
+  <ResponseMetadata><RequestId>s3-proxy</RequestId></ResponseMetadata>
+</GetAccessKeyLastUsedResponse>

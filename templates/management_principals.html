@@ -1,0 +1,11 @@
+{% if principals.len() == 0 %}
+<tr><td colspan="3">No principals</td></tr>
+{% else %}
+{% for principal in principals %}
+<tr>
+  <td>{{ principal.display_name }} ({{ principal.id }})</td>
+  <td>{{ principal.namespace }}</td>
+  <td>{% if principal.access_keys.len() == 0 %}None{% else %}{% for key in principal.access_keys %}<code>{{ key.id }}</code> [{{ key.status }}]{% if !loop.last %}<br>{% endif %}{% endfor %}{% endif %}</td>
+</tr>
+{% endfor %}
+{% endif %}

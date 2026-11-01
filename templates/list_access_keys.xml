@@ -1,0 +1,12 @@
+<ListAccessKeysResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">
+  <ListAccessKeysResult>
+{% for access_key in access_keys %}    <AccessKeyMetadata>
+      <UserName>{{ user_name }}</UserName>
+      <AccessKeyId>{{ access_key.id }}</AccessKeyId>
+      <Status>{{ access_key.status }}</Status>
+{% if let Some(created_at) = access_key.created_at %}      <CreateDate>{{ created_at }}</CreateDate>
+{% endif %}    </AccessKeyMetadata>
+{% endfor %}    <IsTruncated>false</IsTruncated>
+  </ListAccessKeysResult>
+  <ResponseMetadata><RequestId>s3-proxy</RequestId></ResponseMetadata>
+</ListAccessKeysResponse>

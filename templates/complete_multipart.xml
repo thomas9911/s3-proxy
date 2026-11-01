@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult><Location>{{ location }}</Location><Bucket>{{ bucket }}</Bucket><Key>{{ key }}</Key><ETag></ETag></CompleteMultipartUploadResult>

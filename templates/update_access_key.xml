@@ -1,0 +1,3 @@
+<UpdateAccessKeyResponse xmlns="https://iam.amazonaws.com/doc/2010-05-08/">
+  <ResponseMetadata><RequestId>s3-proxy</RequestId></ResponseMetadata>
+</UpdateAccessKeyResponse>

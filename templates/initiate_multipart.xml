@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult><Bucket>{{ bucket }}</Bucket><Key>{{ key }}</Key><UploadId>{{ upload_id }}</UploadId></InitiateMultipartUploadResult>
