@@ -342,9 +342,7 @@ async function startTarget() {
 		`MINIO_ROOT_USER=${accessKeyId}`,
 		"--env",
 		`MINIO_ROOT_PASSWORD=${secretAccessKey}`,
-		"minio/minio:latest",
-		"server",
-		"/data",
+		"bitnamilegacy/minio:2025.7.23-debian-12-r3",
 	]);
 	ownsContainer = true;
 	await waitForEndpoint();
