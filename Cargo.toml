@@ -4,8 +4,32 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["management"]
+default = ["management", "all-backends", "redis", "postgres"]
 management = []
+all-backends = [
+    "opendal/services-b2",
+    "opendal/services-cloudflare-kv",
+    "opendal/services-compfs",
+    "opendal/services-cos",
+    "opendal/services-dashmap",
+    "opendal/services-github",
+    "opendal/services-koofr",
+    "opendal/services-mini-moka",
+    "opendal/services-moka",
+    "opendal/services-obs",
+    "opendal/services-oss",
+    "opendal/services-s3",
+    "opendal/services-seafile",
+    "opendal/services-sled",
+    "opendal/services-swift",
+    "opendal/services-tos",
+    "opendal/services-upyun",
+    "opendal/services-vercel-blob",
+    "opendal/services-webdav",
+    "opendal/services-yandex-disk",
+]
+redis = ["dep:deadpool-redis"]
+postgres = ["sqlx/postgres"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -23,7 +47,7 @@ axum = { version = "0.8.9", features = ["http2", "multipart"] }
 axum-extra = { version = "0.12.6", features = ["typed-header"] }
 axum-route-error = "5.1.0"
 config = { version = "0.15.25", default-features = false }
-deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1", "serde"] }
+deadpool-redis = { version = "0.23.0", features = ["rt_tokio_1", "serde"], optional = true }
 futures-util = "0.3.33"
 headers = "0.4.1"
 httpdate = "1.0.3"
@@ -31,28 +55,8 @@ opendal = {
     git = "https://github.com/apache/opendal.git",
     rev = "c171ae6b088a6471854bd4c2327abda9e8637fe8",
     features = [
-        "services-b2",
-        "services-cloudflare-kv",
-        "services-compfs",
-        "services-cos",
-        "services-dashmap",
         "services-fs",
-        "services-github",
-        "services-koofr",
         "services-memory",
-        "services-mini-moka",
-        "services-moka",
-        "services-obs",
-        "services-oss",
-        "services-s3",
-        "services-seafile",
-        "services-sled",
-        "services-swift",
-        "services-tos",
-        "services-upyun",
-        "services-vercel-blob",
-        "services-webdav",
-        "services-yandex-disk",
         "layers-tracing",
     ],
 }
@@ -61,7 +65,7 @@ hex = "0.4.3"
 rand = "0.10.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite", "postgres"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "any", "sqlite"] }
 time = { version = "0.3.54", features = ["formatting", "macros"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["full"] }

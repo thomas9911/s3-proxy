@@ -58,7 +58,61 @@ For example, an S3 service can be configured with
 Set both admin variables to create the initial credential on startup. Existing
 credentials are not overwritten.
 
+## Metadata synchronization
+
+To adopt existing data, arrange it in the proxy storage layout
+`namespace/bucket/key`, configure OpenDAL and the metadata store, then run a
+one-shot metadata import before starting the server:
+
+```text
+cargo run --release -- --sync-metadata --dry-run
+cargo run --release -- --sync-metadata
+```
+
+Use `--namespace admin` to import only one namespace. The command creates a
+default namespace owner only when it is absent and imports content type, size,
+ETag, and last-modified values from OpenDAL. It never changes object data,
+access keys, ACLs, bucket policies, or versioning state. Imported objects are
+private unless access-control metadata already exists.
+
+This command does not remap a flat external S3 bucket into the proxy layout.
+For an existing filesystem or OpenDAL S3 service, set its root/prefix or move
+the data so that the proxy can see `namespace/bucket/key` paths first.
+
+## Single-bucket layout
+
+To serve an existing OpenDAL root as one S3 bucket without moving files, set:
+
+```text
+S3_PROXY__STORAGE_LAYOUT=single_bucket
+S3_PROXY__SINGLE_BUCKET__NAMESPACE=admin
+S3_PROXY__SINGLE_BUCKET__NAME=storage
+```
+
+For example, `photos/cat.jpg` at the configured physical root is exposed as
+`s3://storage/photos/cat.jpg`. Proxy-owned multipart and versioning state is
+stored under `.s3-proxy/` and is excluded from object listings.
+
 ## Operations
+
+## Build profiles
+
+The default build includes the management UI, Redis and PostgreSQL metadata
+backends, and every OpenDAL provider supported by this repository:
+
+```text
+cargo build --release
+```
+
+For a smaller local-only build with SQLite metadata and only the `memory` and
+filesystem OpenDAL providers, use:
+
+```text
+cargo build --release --no-default-features
+```
+
+The minimal build intentionally rejects Redis, PostgreSQL, and other provider
+names at configuration time because they are not compiled into the binary.
 
 `GET /healthz` reports process health, `GET /readyz` verifies the metadata and
 OpenDAL services, and `GET /metrics` exposes Prometheus text metrics. Requests

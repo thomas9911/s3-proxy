@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{templates, AppState};
+use crate::{storage, templates, AppState};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::StatusCode;
@@ -13,33 +13,46 @@ pub async fn list_buckets(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
 
-    let mut lister = opendal_operator
-        .lister_with(&format!("{}/", namespace))
-        .await?;
-
     let mut buckets = Vec::new();
-    while let Some(entry) = lister.next().await {
-        match entry {
-            Ok(entry) => {
-                if entry.metadata().is_dir()
-                    && entry.path().trim_end_matches('/') != namespace
-                    && entry.name().trim_end_matches('/') != ".s3-proxy"
-                {
-                    buckets.push(templates::ListBucketItem {
-                        name: entry.name().trim_end_matches('/').to_string().into(),
-                        timestamp: None,
-                    })
+    if storage::is_single_bucket(&config) {
+        if let Some(single) = config
+            .single_bucket
+            .as_ref()
+            .filter(|single| single.namespace == *namespace)
+        {
+            buckets.push(templates::ListBucketItem {
+                name: single.name.as_str().into(),
+                timestamp: None,
+            });
+        }
+    } else {
+        let mut lister = opendal_operator
+            .lister_with(&format!("{}/", namespace))
+            .await?;
+        while let Some(entry) = lister.next().await {
+            match entry {
+                Ok(entry) => {
+                    if entry.metadata().is_dir()
+                        && entry.path().trim_end_matches('/') != namespace
+                        && entry.name().trim_end_matches('/') != ".s3-proxy"
+                    {
+                        buckets.push(templates::ListBucketItem {
+                            name: entry.name().trim_end_matches('/').to_string().into(),
+                            timestamp: None,
+                        })
+                    }
                 }
-            }
-            Err(error) => {
-                tracing::error!("{}", error);
-                return Err(RouteError::new_internal_server());
+                Err(error) => {
+                    tracing::error!(%error, "failed to list buckets");
+                    return Err(RouteError::new_internal_server());
+                }
             }
         }
     }
@@ -71,6 +84,12 @@ pub async fn put_bucket(
         .unwrap_or_default()
         .split('&')
         .any(|part| part == "versioning" || part.starts_with("versioning="));
+    let is_acl = request
+        .uri()
+        .query()
+        .unwrap_or_default()
+        .split('&')
+        .any(|part| part == "acl" || part.starts_with("acl="));
     let header_map = request.headers().clone();
     let signature = match VerifiedRequest::from_request(request, &state).await {
         Ok(signature) => signature,
@@ -106,10 +125,21 @@ pub async fn put_bucket(
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    if is_acl {
+        return s3_error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "Bucket ACLs are not supported; use a bucket policy instead.",
+        );
+    }
+
     if is_versioning {
         if !state
             .opendal_operator
-            .exists(&format!("{}/{}/", signature.namespace, bucket_name))
+            .exists(
+                &storage::bucket_prefix(&state.config, &signature.namespace, &bucket_name)
+                    .expect("validated bucket layout"),
+            )
             .await
             .unwrap_or(false)
         {
@@ -141,6 +171,7 @@ pub async fn put_bucket(
         };
         if let Err(error) = crate::versioning::set_bucket_versioning(
             &state.opendal_operator,
+            &state.config,
             &signature.namespace,
             &bucket_name,
             status,
@@ -155,7 +186,7 @@ pub async fn put_bucket(
 
     create_bucket_inner(bucket_name, header_map, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,11 +202,27 @@ async fn create_bucket_inner(
     AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
+
+    if storage::is_single_bucket(&config) {
+        if storage::bucket_prefix(&config, namespace, &bucket_name).is_some() {
+            return Ok(s3_error_response(
+                StatusCode::CONFLICT,
+                "BucketAlreadyOwnedByYou",
+                "The configured bucket already exists.",
+            ));
+        }
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The requested bucket is not configured.",
+        ));
+    }
 
     let utf8_slice = match std::str::from_utf8(&signature.bytes) {
         Ok(body) => body,
@@ -203,7 +250,10 @@ async fn create_bucket_inner(
         .create_dir(&format!("{}/", namespace))
         .await?;
     opendal_operator
-        .create_dir(&format!("{}/{}/", namespace, bucket_name))
+        .create_dir(
+            &storage::bucket_prefix(&config, namespace, &bucket_name)
+                .expect("validated bucket layout"),
+        )
         .await?;
 
     if let Some(public) = super::objects::public_acl(&header_map) {
@@ -244,7 +294,7 @@ pub async fn delete_bucket_route(
 
     delete_bucket_inner(bucket_name, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub(crate) async fn delete_bucket_inner(
@@ -252,12 +302,21 @@ pub(crate) async fn delete_bucket_inner(
     AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = signature.namespace;
-    let bucket_path = format!("{}/{}/", namespace, bucket_name);
+    if storage::is_single_bucket(&config) {
+        return Ok(s3_error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "OperationNotSupported",
+            "The configured single bucket cannot be deleted.",
+        ));
+    }
+    let bucket_path =
+        storage::bucket_prefix(&config, &namespace, &bucket_name).expect("validated bucket layout");
     if !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
@@ -275,6 +334,7 @@ pub(crate) async fn delete_bucket_inner(
     metadata_store
         .delete_bucket_policy(&namespace, &bucket_name)
         .await?;
-    crate::versioning::delete_bucket_state(&opendal_operator, &namespace, &bucket_name).await?;
+    crate::versioning::delete_bucket_state(&opendal_operator, &config, &namespace, &bucket_name)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }

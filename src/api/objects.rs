@@ -1,5 +1,5 @@
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{metadata::ObjectMetadata, templates, AppState};
+use crate::{metadata::ObjectMetadata, storage, templates, AppState};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, Request, State};
 use axum::http::header::{
@@ -26,10 +26,14 @@ pub async fn create_object(
     crate::metrics::record_storage();
     let namespace = signature.namespace;
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -37,7 +41,8 @@ pub async fn create_object(
         ));
     }
 
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let filepath = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("bucket path was validated above");
     let content_length = signature.bytes.len() as u64;
     if !crate::quota::allows_storage(
         &config.quotas,
@@ -56,6 +61,7 @@ pub async fn create_object(
     }
     crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -135,6 +141,7 @@ pub async fn create_object(
 
     let version_id = crate::versioning::record_put(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -210,14 +217,14 @@ pub async fn put_object(
             part_number,
         )
         .await
-        .map_or_else(IntoResponse::into_response, |response| response);
+        .unwrap_or_else(IntoResponse::into_response);
     }
     if let Some(source) = headers.get("x-amz-copy-source").cloned() {
         return copy_object(path, headers, state, verified, &source).await;
     }
     create_object(path, headers, State(state), verified)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn copy_object(
@@ -255,11 +262,18 @@ async fn copy_object(
         ..
     } = state;
     let namespace = signature.namespace;
-    let destination_bucket = format!("{namespace}/{bucket_name}/");
-    if !opendal_operator
-        .exists(&destination_bucket)
-        .await
-        .unwrap_or(false)
+    let Some(destination_bucket) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        );
+    };
+    if !storage::is_single_bucket(&config)
+        && !opendal_operator
+            .exists(&destination_bucket)
+            .await
+            .unwrap_or(false)
     {
         return s3_error_response(
             StatusCode::NOT_FOUND,
@@ -267,8 +281,15 @@ async fn copy_object(
             "The specified bucket does not exist.",
         );
     }
-    let from = format!("{namespace}/{source_bucket}/{source_object}");
-    let to = format!("{namespace}/{bucket_name}/{object_name}");
+    let Some(from) = storage::object_path(&config, &namespace, source_bucket, source_object) else {
+        return s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified source bucket does not exist.",
+        );
+    };
+    let to = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("destination bucket path was validated above");
     if !opendal_operator.exists(&from).await.unwrap_or(false) {
         return s3_error_response(
             StatusCode::NOT_FOUND,
@@ -301,6 +322,7 @@ async fn copy_object(
     }
     if let Err(error) = crate::versioning::prepare_overwrite(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -364,6 +386,7 @@ async fn copy_object(
     }
     let version_id = match crate::versioning::record_put(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -412,13 +435,18 @@ pub async fn get_object(
     let AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     } = state;
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -428,6 +456,7 @@ pub async fn get_object(
 
     let (filepath, selected_version_id) = match crate::versioning::version(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -454,7 +483,8 @@ pub async fn get_object(
             ))
         }
         Ok(None) => (
-            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            storage::object_path(&config, &namespace, &bucket_name, &object_name)
+                .expect("bucket path was validated above"),
             None,
         ),
         Err(error) => {
@@ -483,13 +513,12 @@ pub async fn get_object(
         .await?;
 
     let object_length = metadata.content_length();
-    let range = match range_header
-        .as_ref()
-        .map(|value| parse_range(value, object_length))
-        .transpose()
-    {
-        Ok(range) => range,
-        Err(response) => return Ok(response),
+    let range = match range_header.as_ref() {
+        Some(value) => match parse_range(value, object_length) {
+            Ok(range) => Some(range),
+            Err(response) => return Ok(response),
+        },
+        None => None,
     };
     let reader = opendal_operator.reader(&filepath).await?;
 
@@ -515,7 +544,7 @@ pub async fn get_object(
         .unwrap_or_else(SystemTime::now);
     response_headers.insert(
         LAST_MODIFIED,
-        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified))?,
     );
     add_user_metadata(&mut response_headers, &stored_metadata).await?;
 
@@ -550,6 +579,7 @@ pub async fn get_object(
     Ok((status, response_headers, Body::from_stream(stream)).into_response())
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_range(value: &HeaderValue, length: u64) -> Result<std::ops::Range<u64>, Response> {
     let value = value.to_str().ok();
     let Some(value) = value.and_then(|value| value.strip_prefix("bytes=")) else {
@@ -611,10 +641,17 @@ pub async fn head_object(
     let AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     } = state;
-    let bucket_path = format!("{}/{}/", namespace, bucket_name);
-    if !opendal_operator.exists(&bucket_path).await? {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -624,6 +661,7 @@ pub async fn head_object(
 
     let (filepath, selected_version_id) = match crate::versioning::version(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -650,7 +688,8 @@ pub async fn head_object(
             ))
         }
         Ok(None) => (
-            format!("{}/{}/{}", namespace, bucket_name, object_name),
+            storage::object_path(&config, &namespace, &bucket_name, &object_name)
+                .expect("bucket path was validated above"),
             None,
         ),
         Err(error) => {
@@ -695,7 +734,7 @@ pub async fn head_object(
         .unwrap_or_else(SystemTime::now);
     headers.insert(
         LAST_MODIFIED,
-        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified.into()))?,
+        HeaderValue::from_str(&httpdate::fmt_http_date(last_modified))?,
     );
     add_user_metadata(&mut headers, &stored_metadata).await?;
     Ok((StatusCode::OK, headers).into_response())
@@ -706,23 +745,29 @@ pub async fn delete_object(
     State(AppState {
         metadata_store,
         opendal_operator,
+        config,
         ..
     }): State<AppState>,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     crate::metrics::record_storage();
     let namespace = signature.namespace;
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    let Some(bucket_path) = storage::bucket_prefix(&config, &namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_path).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist.",
         ));
     }
-    let filepath = format!("{}/{}/{}", namespace, bucket_name, object_name);
+    let filepath = storage::object_path(&config, &namespace, &bucket_name, &object_name)
+        .expect("bucket path was validated above");
     if opendal_operator.exists(&filepath).await? {
         crate::retry::retry("delete_object", || opendal_operator.delete(&filepath)).await?;
     }
@@ -735,6 +780,7 @@ pub async fn delete_object(
         .await?;
     let version_id = crate::versioning::record_delete_marker(
         &opendal_operator,
+        &config,
         &namespace,
         &bucket_name,
         &object_name,
@@ -802,11 +848,11 @@ pub async fn delete_object_route(
     if let Some(upload_id) = upload_id {
         return super::post::abort_multipart(bucket_name, state, verified, upload_id)
             .await
-            .map_or_else(IntoResponse::into_response, |response| response);
+            .unwrap_or_else(IntoResponse::into_response);
     }
     delete_object(path, State(state), verified)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
@@ -818,204 +864,6 @@ pub(crate) fn public_acl(headers: &HeaderMap) -> Option<bool> {
             "private" => Some(false),
             _ => None,
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{copy_object, create_object, get_object, public_acl, resolve_read_namespace};
-    use crate::metadata::{MetadataStore, SqliteMetadataStore};
-    use crate::signature::VerifiedRequest;
-    use crate::{AppState, Config, SqliteConfig};
-    use axum::body::{to_bytes, Body, Bytes};
-    use axum::extract::{Path, State};
-    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
-    use opendal::services::Memory;
-    use opendal::Operator;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    async fn test_state() -> (AppState, Arc<SqliteMetadataStore>, Operator) {
-        let metadata_store = Arc::new(
-            SqliteMetadataStore::connect("sqlite::memory:")
-                .await
-                .unwrap(),
-        );
-        let operator = Operator::new(Memory::default()).unwrap();
-        let config = Config {
-            server_host: "127.0.0.1:0".to_string(),
-            external_server_host: "http://127.0.0.1:0".to_string(),
-            max_request_body_bytes: 256 * 1024 * 1024,
-            metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
-            redis: None,
-            sqlite: Some(SqliteConfig {
-                url: "sqlite::memory:".to_string(),
-            }),
-            postgres: None,
-            admin: None,
-            #[cfg(feature = "management")]
-            management: None,
-            quotas: crate::quota::QuotaConfig::default(),
-            opendal_provider: "memory".to_string(),
-            opendal: HashMap::new(),
-        };
-        (
-            AppState {
-                metadata_store: metadata_store.clone(),
-                config: Arc::new(config),
-                opendal_operator: operator.clone(),
-            },
-            metadata_store,
-            operator,
-        )
-    }
-
-    #[test]
-    fn parses_public_acl_headers() {
-        let mut headers = HeaderMap::new();
-        assert_eq!(public_acl(&headers), None);
-        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
-        assert_eq!(public_acl(&headers), Some(true));
-        headers.insert("x-amz-acl", HeaderValue::from_static("private"));
-        assert_eq!(public_acl(&headers), Some(false));
-    }
-
-    #[tokio::test]
-    async fn object_handlers_cover_overwrite_copy_and_range_read() {
-        let (state, metadata_store, operator) = test_state().await;
-        operator.create_dir("namespace/bucket/").await.unwrap();
-        let original = Bytes::from_static(b"original body");
-        let mut headers = HeaderMap::new();
-        headers.insert("content-type", HeaderValue::from_static("text/plain"));
-        headers.insert("x-amz-meta-old", HeaderValue::from_static("value"));
-        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
-        let response = create_object(
-            Path(("bucket".to_string(), "source.txt".to_string())),
-            headers,
-            State(state.clone()),
-            VerifiedRequest {
-                access_key: "access".to_string(),
-                namespace: "namespace".to_string(),
-                bytes: original.clone(),
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        metadata_store
-            .set_bucket_public("namespace", "bucket", true)
-            .await
-            .unwrap();
-        let public_bucket_namespace = resolve_read_namespace(
-            Request::builder()
-                .uri("/bucket/missing")
-                .body(Body::empty())
-                .unwrap(),
-            &state,
-            "bucket",
-            "missing",
-        )
-        .await
-        .unwrap();
-        assert_eq!(public_bucket_namespace, "namespace");
-        metadata_store
-            .set_bucket_public("namespace", "bucket", false)
-            .await
-            .unwrap();
-        metadata_store
-            .set_bucket_policy(
-                "policy-namespace",
-                "policy-bucket",
-                r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-bucket/*"}}"#,
-            )
-            .await
-            .unwrap();
-        let policy_namespace = resolve_read_namespace(
-            Request::builder()
-                .uri("/policy-bucket/object")
-                .body(Body::empty())
-                .unwrap(),
-            &state,
-            "policy-bucket",
-            "object",
-        )
-        .await
-        .unwrap();
-        assert_eq!(policy_namespace, "policy-namespace");
-
-        let copied = copy_object(
-            Path(("bucket".to_string(), "copied.txt".to_string())),
-            HeaderMap::new(),
-            state.clone(),
-            VerifiedRequest {
-                access_key: "access".to_string(),
-                namespace: "namespace".to_string(),
-                bytes: Bytes::new(),
-            },
-            &HeaderValue::from_static("bucket/source.txt"),
-        )
-        .await;
-        assert_eq!(copied.status(), StatusCode::OK);
-
-        let copied_metadata = metadata_store
-            .object_metadata("namespace", "bucket", "copied.txt")
-            .await
-            .unwrap();
-        assert_eq!(copied_metadata.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(
-            metadata_store
-                .public_object_namespace("bucket", "copied.txt")
-                .await
-                .unwrap(),
-            None
-        );
-
-        let range_request = Request::builder()
-            .uri("/bucket/source.txt")
-            .header("range", "bytes=0-7")
-            .body(Body::empty())
-            .unwrap();
-        let range_response = get_object(
-            Path(("bucket".to_string(), "source.txt".to_string())),
-            State(state.clone()),
-            range_request,
-        )
-        .await
-        .unwrap();
-        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(
-            to_bytes(range_response.into_body(), 1024).await.unwrap(),
-            Bytes::from_static(b"original")
-        );
-
-        let mut overwrite_headers = HeaderMap::new();
-        overwrite_headers.insert("content-type", HeaderValue::from_static("text/plain"));
-        let replacement = Bytes::from_static(b"replacement");
-        create_object(
-            Path(("bucket".to_string(), "source.txt".to_string())),
-            overwrite_headers,
-            State(state),
-            VerifiedRequest {
-                access_key: "access".to_string(),
-                namespace: "namespace".to_string(),
-                bytes: replacement,
-            },
-        )
-        .await
-        .unwrap();
-        let metadata = metadata_store
-            .object_metadata("namespace", "bucket", "source.txt")
-            .await
-            .unwrap();
-        assert!(metadata.user_metadata.is_empty());
-        assert_eq!(
-            metadata_store
-                .public_object_namespace("bucket", "source.txt")
-                .await
-                .unwrap(),
-            None
-        );
-    }
 }
 
 async fn resolve_policy_namespace(
@@ -1194,4 +1042,205 @@ async fn add_user_metadata(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{copy_object, create_object, get_object, public_acl, resolve_read_namespace};
+    use crate::metadata::{MetadataStore, SqliteMetadataStore};
+    use crate::signature::VerifiedRequest;
+    use crate::{AppState, Config, SqliteConfig};
+    use axum::body::{to_bytes, Body, Bytes};
+    use axum::extract::{Path, State};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
+    use opendal::services::Memory;
+    use opendal::Operator;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    async fn test_state() -> (AppState, Arc<SqliteMetadataStore>, Operator) {
+        let metadata_store = Arc::new(
+            SqliteMetadataStore::connect("sqlite::memory:")
+                .await
+                .unwrap(),
+        );
+        let operator = Operator::new(Memory::default()).unwrap();
+        let config = Config {
+            server_host: "127.0.0.1:0".to_string(),
+            external_server_host: "http://127.0.0.1:0".to_string(),
+            max_request_body_bytes: 256 * 1024 * 1024,
+            metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            #[cfg(feature = "redis")]
+            redis: None,
+            sqlite: Some(SqliteConfig {
+                url: "sqlite::memory:".to_string(),
+            }),
+            postgres: None,
+            admin: None,
+            #[cfg(feature = "management")]
+            management: None,
+            quotas: crate::quota::QuotaConfig::default(),
+            opendal_provider: "memory".to_string(),
+            opendal: HashMap::new(),
+            storage_layout: crate::StorageLayout::Namespaced,
+            single_bucket: None,
+        };
+        (
+            AppState {
+                metadata_store: metadata_store.clone(),
+                config: Arc::new(config),
+                opendal_operator: operator.clone(),
+            },
+            metadata_store,
+            operator,
+        )
+    }
+
+    #[test]
+    fn parses_public_acl_headers() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(public_acl(&headers), None);
+        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
+        assert_eq!(public_acl(&headers), Some(true));
+        headers.insert("x-amz-acl", HeaderValue::from_static("private"));
+        assert_eq!(public_acl(&headers), Some(false));
+    }
+
+    #[tokio::test]
+    async fn object_handlers_cover_overwrite_copy_and_range_read() {
+        let (state, metadata_store, operator) = test_state().await;
+        operator.create_dir("namespace/bucket/").await.unwrap();
+        let original = Bytes::from_static(b"original body");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        headers.insert("x-amz-meta-old", HeaderValue::from_static("value"));
+        headers.insert("x-amz-acl", HeaderValue::from_static("public-read"));
+        let response = create_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            headers,
+            State(state.clone()),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: original.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        metadata_store
+            .set_bucket_public("namespace", "bucket", true)
+            .await
+            .unwrap();
+        let public_bucket_namespace = resolve_read_namespace(
+            Request::builder()
+                .uri("/bucket/missing")
+                .body(Body::empty())
+                .unwrap(),
+            &state,
+            "bucket",
+            "missing",
+        )
+        .await
+        .unwrap();
+        assert_eq!(public_bucket_namespace, "namespace");
+        metadata_store
+            .set_bucket_public("namespace", "bucket", false)
+            .await
+            .unwrap();
+        metadata_store
+            .set_bucket_policy(
+                "policy-namespace",
+                "policy-bucket",
+                r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::policy-bucket/*"}}"#,
+            )
+            .await
+            .unwrap();
+        let policy_namespace = resolve_read_namespace(
+            Request::builder()
+                .uri("/policy-bucket/object")
+                .body(Body::empty())
+                .unwrap(),
+            &state,
+            "policy-bucket",
+            "object",
+        )
+        .await
+        .unwrap();
+        assert_eq!(policy_namespace, "policy-namespace");
+
+        let copied = copy_object(
+            Path(("bucket".to_string(), "copied.txt".to_string())),
+            HeaderMap::new(),
+            state.clone(),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: Bytes::new(),
+            },
+            &HeaderValue::from_static("bucket/source.txt"),
+        )
+        .await;
+        assert_eq!(copied.status(), StatusCode::OK);
+
+        let copied_metadata = metadata_store
+            .object_metadata("namespace", "bucket", "copied.txt")
+            .await
+            .unwrap();
+        assert_eq!(copied_metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            metadata_store
+                .public_object_namespace("bucket", "copied.txt")
+                .await
+                .unwrap(),
+            None
+        );
+
+        let range_request = Request::builder()
+            .uri("/bucket/source.txt")
+            .header("range", "bytes=0-7")
+            .body(Body::empty())
+            .unwrap();
+        let range_response = get_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            State(state.clone()),
+            range_request,
+        )
+        .await
+        .unwrap();
+        assert_eq!(range_response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(range_response.into_body(), 1024).await.unwrap(),
+            Bytes::from_static(b"original")
+        );
+
+        let mut overwrite_headers = HeaderMap::new();
+        overwrite_headers.insert("content-type", HeaderValue::from_static("text/plain"));
+        let replacement = Bytes::from_static(b"replacement");
+        create_object(
+            Path(("bucket".to_string(), "source.txt".to_string())),
+            overwrite_headers,
+            State(state),
+            VerifiedRequest {
+                access_key: "access".to_string(),
+                namespace: "namespace".to_string(),
+                bytes: replacement,
+            },
+        )
+        .await
+        .unwrap();
+        let metadata = metadata_store
+            .object_metadata("namespace", "bucket", "source.txt")
+            .await
+            .unwrap();
+        assert!(metadata.user_metadata.is_empty());
+        assert_eq!(
+            metadata_store
+                .public_object_namespace("bucket", "source.txt")
+                .await
+                .unwrap(),
+            None
+        );
+    }
 }

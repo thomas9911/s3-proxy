@@ -24,6 +24,8 @@ mod policy;
 pub mod quota;
 mod retry;
 mod signature;
+pub mod storage;
+pub mod sync;
 pub mod templates;
 mod versioning;
 
@@ -37,6 +39,7 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     #[serde(default = "default_metadata_backend")]
     pub metadata_backend: metadata::MetaDataBackend,
+    #[cfg(feature = "redis")]
     pub redis: Option<deadpool_redis::Config>,
     #[serde(default = "default_sqlite")]
     pub sqlite: Option<SqliteConfig>,
@@ -52,6 +55,23 @@ pub struct Config {
     pub opendal_provider: String,
     #[serde(default)]
     pub opendal: HashMap<String, String>,
+    #[serde(default)]
+    pub storage_layout: StorageLayout,
+    pub single_bucket: Option<SingleBucketConfig>,
+}
+
+#[derive(Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageLayout {
+    #[default]
+    Namespaced,
+    SingleBucket,
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct SingleBucketConfig {
+    pub namespace: String,
+    pub name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -123,9 +143,18 @@ pub struct AppState {
 
 impl AppState {
     pub async fn from_config(config: Config) -> anyhow::Result<AppState> {
+        if matches!(config.storage_layout, StorageLayout::SingleBucket) {
+            let single = config.single_bucket.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("single_bucket configuration is required for single_bucket layout")
+            })?;
+            if single.namespace.is_empty() || single.name.is_empty() {
+                anyhow::bail!("single_bucket namespace and name must not be empty")
+            }
+        }
         opendal::init_default_registry();
         let metadata_store: Arc<dyn metadata::MetadataStore> =
             match config.metadata_backend {
+                #[cfg(feature = "redis")]
                 metadata::MetaDataBackend::Redis => {
                     let redis_config = config.redis.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("Redis metadata configuration is missing")
@@ -139,6 +168,7 @@ impl AppState {
                     })?;
                     Arc::new(metadata::SqliteMetadataStore::connect(&sqlite_config.url).await?)
                 }
+                #[cfg(feature = "postgres")]
                 metadata::MetaDataBackend::Postgres => {
                     let postgres_config = config.postgres.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("PostgreSQL metadata configuration is missing")
@@ -358,6 +388,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 async fn metadata_debug(
     State(AppState { metadata_store, .. }): State<AppState>,
 ) -> Result<impl IntoResponse, RouteError> {

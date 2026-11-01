@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use crate::signature::{s3_error_response, VerifiedRequest};
-use crate::{templates, AppState};
+use crate::{storage, templates, AppState};
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::{FromRequest, Path, Query, State};
@@ -146,6 +146,7 @@ pub async fn get_bucket(
     if is_versioning {
         let status = match crate::versioning::bucket_versioning(
             &state.opendal_operator,
+            &state.config,
             &signature.namespace,
             &bucket_name,
         )
@@ -171,7 +172,7 @@ pub async fn get_bucket(
 
     list_objects_inner(bucket_name, query, state, signature)
         .await
-        .map_or_else(IntoResponse::into_response, |response| response)
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 async fn list_object_versions(
@@ -192,16 +193,20 @@ async fn list_object_versions(
             "The specified bucket does not exist.",
         );
     }
-    let versions =
-        match crate::versioning::list_versions(&state.opendal_operator, namespace, &bucket_name)
-            .await
-        {
-            Ok(versions) => versions,
-            Err(error) => {
-                tracing::error!(%error, "failed to list object versions");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+    let versions = match crate::versioning::list_versions(
+        &state.opendal_operator,
+        &state.config,
+        namespace,
+        &bucket_name,
+    )
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => {
+            tracing::error!(%error, "failed to list object versions");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let mut latest = HashSet::new();
     let mut versions_output = Vec::new();
     let mut markers_output = Vec::new();
@@ -276,6 +281,7 @@ mod tests {
                 external_server_host: "http://127.0.0.1:0".to_string(),
                 max_request_body_bytes: 256 * 1024 * 1024,
                 metadata_backend: MetaDataBackend::Sqlite,
+                #[cfg(feature = "redis")]
                 redis: None,
                 sqlite: Some(SqliteConfig {
                     url: "sqlite::memory:".to_string(),
@@ -287,6 +293,8 @@ mod tests {
                 quotas: crate::quota::QuotaConfig::default(),
                 opendal_provider: "memory".to_string(),
                 opendal: HashMap::new(),
+                storage_layout: crate::StorageLayout::Namespaced,
+                single_bucket: None,
             }),
             opendal_operator: operator,
         };
@@ -303,21 +311,27 @@ mod tests {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 async fn list_objects_inner(
     bucket_name: String,
     query: HashMap<String, String>,
     AppState {
-        opendal_operator, ..
+        opendal_operator,
+        config,
+        ..
     }: AppState,
     signature: VerifiedRequest,
 ) -> Result<Response, RouteError> {
     let namespace = &signature.namespace;
-    let bucket_prefix = format!("{}/{}/", namespace, bucket_name);
+    let Some(bucket_prefix) = storage::bucket_prefix(&config, namespace, &bucket_name) else {
+        return Ok(s3_error_response(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+        ));
+    };
 
-    if !opendal_operator
-        .exists(&format!("{}/{}/", namespace, bucket_name))
-        .await?
-    {
+    if !storage::is_single_bucket(&config) && !opendal_operator.exists(&bucket_prefix).await? {
         return Ok(s3_error_response(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -356,6 +370,9 @@ async fn list_objects_inner(
                         .path()
                         .strip_prefix(&bucket_prefix)
                         .unwrap_or(entry.path());
+                    if key == ".s3-proxy" || key.starts_with(".s3-proxy/") {
+                        continue;
+                    }
                     let etag = metadata.etag().map(|y| Cow::from(y.to_string()));
                     let last_modified =
                         metadata.last_modified().map(|dt| Cow::from(dt.to_string()));
