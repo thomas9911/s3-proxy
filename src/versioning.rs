@@ -372,6 +372,7 @@ mod tests {
             external_server_host: String::new(),
             max_request_body_bytes: 0,
             metadata_backend: crate::metadata::MetaDataBackend::Sqlite,
+            #[cfg(feature = "redis")]
             redis: None,
             sqlite: None,
             postgres: None,

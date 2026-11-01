@@ -39,6 +39,7 @@ pub struct Config {
     pub max_request_body_bytes: usize,
     #[serde(default = "default_metadata_backend")]
     pub metadata_backend: metadata::MetaDataBackend,
+    #[cfg(feature = "redis")]
     pub redis: Option<deadpool_redis::Config>,
     #[serde(default = "default_sqlite")]
     pub sqlite: Option<SqliteConfig>,
@@ -153,6 +154,7 @@ impl AppState {
         opendal::init_default_registry();
         let metadata_store: Arc<dyn metadata::MetadataStore> =
             match config.metadata_backend {
+                #[cfg(feature = "redis")]
                 metadata::MetaDataBackend::Redis => {
                     let redis_config = config.redis.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("Redis metadata configuration is missing")
@@ -166,6 +168,7 @@ impl AppState {
                     })?;
                     Arc::new(metadata::SqliteMetadataStore::connect(&sqlite_config.url).await?)
                 }
+                #[cfg(feature = "postgres")]
                 metadata::MetaDataBackend::Postgres => {
                     let postgres_config = config.postgres.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("PostgreSQL metadata configuration is missing")

@@ -95,6 +95,25 @@ stored under `.s3-proxy/` and is excluded from object listings.
 
 ## Operations
 
+## Build profiles
+
+The default build includes the management UI, Redis and PostgreSQL metadata
+backends, and every OpenDAL provider supported by this repository:
+
+```text
+cargo build --release
+```
+
+For a smaller local-only build with SQLite metadata and only the `memory` and
+filesystem OpenDAL providers, use:
+
+```text
+cargo build --release --no-default-features
+```
+
+The minimal build intentionally rejects Redis, PostgreSQL, and other provider
+names at configuration time because they are not compiled into the binary.
+
 `GET /healthz` reports process health, `GET /readyz` verifies the metadata and
 OpenDAL services, and `GET /metrics` exposes Prometheus text metrics. Requests
 and authenticated principal activity are emitted as structured `tracing` audit

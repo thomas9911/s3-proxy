@@ -101,7 +101,7 @@ const environment = {
 console.log(`Serving ${dataRoot} as s3://${settings.bucket}/ at ${settings["external-url"]}`);
 console.log(`Reserved proxy state is stored in ${dataRoot}\\.s3-proxy\\`);
 
-const proxy = Bun.spawn(["cargo", "run", "--release"], {
+const proxy = Bun.spawn(["cargo", "run", "--release", "--no-default-features"], {
 	env: environment,
 	stdin: "inherit",
 	stdout: "inherit",
